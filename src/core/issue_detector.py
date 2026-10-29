@@ -45,6 +45,10 @@ class IssueDetector:
         url = result.get('url', '')
         issues = []
 
+        # An incomplete body cannot support content/SEO conclusions.
+        if result.get('error_type') == 'file_too_large':
+            return
+
         # Skip if URL matches exclusion patterns
         if self._should_exclude(url):
             return

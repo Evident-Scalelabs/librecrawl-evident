@@ -1,5 +1,6 @@
 """Sitemap discovery and parsing"""
 import gzip
+import io
 import xml.etree.ElementTree as ET
 from urllib.parse import urlparse
 
@@ -7,10 +8,20 @@ from urllib.parse import urlparse
 class SitemapParser:
     """Discovers and parses sitemap.xml files"""
 
-    def __init__(self, session, base_domain, timeout=10):
+    def __init__(self, session, base_domain, timeout=10, max_file_size=50 * 1024 * 1024,
+                 on_error=None, should_continue=None):
         self.session = session
         self.base_domain = base_domain
         self.timeout = timeout
+        self.max_file_size = max_file_size
+        self.on_error = on_error
+        self.should_continue = should_continue or (lambda: True)
+        self.errors = []
+
+    def _record_error(self, url, error):
+        self.errors.append({'url': url, 'error': str(error)})
+        if self.on_error:
+            self.on_error(url, error)
 
     def discover_sitemaps(self, base_url):
         """
@@ -38,10 +49,13 @@ class SitemapParser:
 
         all_urls = []
         for sitemap_url in sitemap_urls:
+            if not self.should_continue():
+                break
             try:
                 urls = self._parse_sitemap(sitemap_url, depth=1)
                 all_urls.extend(urls)
             except Exception as e:
+                self._record_error(sitemap_url, e)
                 print(f"Failed to parse sitemap {sitemap_url}: {e}")
 
         return all_urls
@@ -61,6 +75,7 @@ class SitemapParser:
                         sitemaps.append(sitemap_url)
 
         except Exception as e:
+            self._record_error(robots_url, e)
             print(f"Could not fetch robots.txt: {e}")
 
         return sitemaps
@@ -72,7 +87,7 @@ class SitemapParser:
         Returns:
             list: List of URLs found in the sitemap
         """
-        if depth > max_depth:
+        if depth > max_depth or not self.should_continue():
             return []
 
         try:
@@ -84,16 +99,19 @@ class SitemapParser:
 
             # Handle compressed sitemaps
             content = response.content
-            if sitemap_url.endswith('.gz') or response.headers.get('content-encoding') == 'gzip':
-                try:
-                    content = gzip.decompress(content)
-                except:
-                    pass
+            # HTTP gzip was already decoded by requests. A .xml.gz file is
+            # another compression layer; bound its inflation independently.
+            if content.startswith(b'\x1f\x8b'):
+                with gzip.GzipFile(fileobj=io.BytesIO(content)) as compressed:
+                    content = compressed.read(int(self.max_file_size) + 1) if self.max_file_size > 0 else compressed.read()
+                if self.max_file_size > 0 and len(content) > self.max_file_size:
+                    raise ValueError(f'Decoded sitemap exceeds {self.max_file_size} bytes; body not parsed')
 
             # Parse XML
             try:
                 root = ET.fromstring(content)
             except ET.ParseError as e:
+                self._record_error(sitemap_url, e)
                 print(f"XML parse error for {sitemap_url}: {e}")
                 return []
 
@@ -128,5 +146,6 @@ class SitemapParser:
             return all_urls
 
         except Exception as e:
+            self._record_error(sitemap_url, e)
             print(f"Error parsing sitemap {sitemap_url}: {e}")
             return []

@@ -108,7 +108,6 @@ def auto_login_local_mode():
             session.permanent = True
 
             print(f"Created and auto-logged in as new 'local' admin user (ID: {user_id})")
-            print(f"Generated password: {random_password}")
 
         conn.close()
         return True
@@ -239,6 +238,15 @@ def login_required(f):
 # Multi-tenant crawler instances
 crawler_instances = {}  # session_id -> {'crawler': WebCrawler, 'settings': SettingsManager, 'last_accessed': datetime}
 instances_lock = threading.Lock()
+SHUTTING_DOWN = False
+
+
+@app.before_request
+def refuse_shutdown_acquisition():
+    if SHUTTING_DOWN and request.endpoint in (
+            'start_crawl', 'resume_crawl', 'resume_crawl_endpoint', 'update_crawler_settings'):
+        return jsonify({'success': False, 'error': 'Service is draining for shutdown'}), 503
+
 
 def get_or_create_crawler():
     """Get or create a crawler instance for the current session"""
@@ -301,17 +309,22 @@ def cleanup_old_instances():
             if now - instance_data['last_accessed'] > timeout:
                 sessions_to_remove.append(session_id)
 
+        removed = 0
         for session_id in sessions_to_remove:
             print(f"Cleaning up crawler instance for session: {session_id}")
-            # Stop any running crawls
             try:
-                crawler_instances[session_id]['crawler'].stop_crawl()
-            except:
-                pass
+                saved, message = crawler_instances[session_id]['crawler'].stop_crawl()
+                if not saved:
+                    print(f"Retaining crawler instance: {message}")
+                    continue
+            except Exception as e:
+                print(f"Retaining crawler instance after stop/save error: {e}")
+                continue
             del crawler_instances[session_id]
+            removed += 1
 
-        if sessions_to_remove:
-            print(f"Cleaned up {len(sessions_to_remove)} inactive crawler instances")
+        if removed:
+            print(f"Cleaned up {removed} inactive crawler instances")
 
 def start_cleanup_thread():
     """Start background thread to cleanup old instances"""
@@ -1203,8 +1216,10 @@ def load_crawl_into_session(crawl_id):
         crawler = get_or_create_crawler()
 
         # Stop any running crawl
-        if crawler.is_running:
-            crawler.stop_crawl()
+        if crawler.is_running or crawler._has_live_threads():
+            stopped, message = crawler.stop_crawl()
+            if not stopped:
+                return jsonify({'success': False, 'error': message}), 409
 
         # Load all data from database
         urls = load_crawled_urls(crawl_id)
@@ -1903,34 +1918,44 @@ def recover_crashed_crawls():
         print(f"Error during crash recovery: {e}")
 
 def graceful_shutdown(signum, frame):
-    """Save all active crawls before shutdown"""
-    print("\n" + "=" * 60)
-    print("GRACEFUL SHUTDOWN")
-    print("=" * 60)
-    print("Saving all active crawls...")
-
-    try:
-        with instances_lock:
-            for session_id, instance_data in list(crawler_instances.items()):
-                crawler = instance_data['crawler']
-                if crawler.is_running and crawler.crawl_id and crawler.db_save_enabled:
-                    print(f"  → Saving crawl {crawler.crawl_id}...")
-                    try:
-                        crawler._save_batch_to_db(force=True)
-                        crawler._save_queue_checkpoint()
-                        from src.crawl_db import set_crawl_status
-                        set_crawl_status(crawler.crawl_id, 'paused')
-                    except Exception as e:
-                        print(f"    Error saving crawl {crawler.crawl_id}: {e}")
-
-        print("All crawls saved successfully")
-        print("=" * 60)
-    except Exception as e:
-        print(f"Error during shutdown: {e}")
-
-    print("Goodbye!")
+    """Close acquisition admission, drain owners, then flush every pending batch."""
+    global SHUTTING_DOWN
+    SHUTTING_DOWN = True
+    all_saved = True
+    with instances_lock:
+        instances = list(crawler_instances.items())
+    owners = [(session_id, data['crawler'],
+               data['crawler'].is_running or data['crawler']._has_live_threads())
+              for session_id, data in instances]
+    # Quiesce all owners first, so waiting for one cannot let another dispatch.
+    for session_id, crawler, was_running in owners:
+        try:
+            crawler.stop_crawl(wait_timeout=0)
+        except Exception as e:
+            print(f"Error requesting stop for crawl {crawler.crawl_id}: {e}")
+    for session_id, crawler, was_running in owners:
+        try:
+            # Includes inactive failed batches. No final snapshot while a worker
+            # or sitemap can still append retained evidence.
+            saved, message = crawler.stop_crawl(wait_timeout=None)
+            if saved and crawler.crawl_id and crawler.db_save_enabled:
+                saved = crawler._save_queue_checkpoint()
+                from src.crawl_db import set_crawl_status
+                if not saved:
+                    set_crawl_status(crawler.crawl_id, 'failed')
+                elif was_running:
+                    set_crawl_status(crawler.crawl_id, 'paused')
+            all_saved = all_saved and saved
+            if not saved:
+                print(f"Could not save crawl {crawler.crawl_id}: {message}")
+        except Exception as e:
+            all_saved = False
+            print(f"Error draining crawl {crawler.crawl_id}: {e}")
+    print("All crawl evidence drained and saved" if all_saved else
+          "Some crawl evidence could not be saved")
     import sys
-    sys.exit(0)
+    sys.exit(0 if all_saved else 1)
+
 
 def main():
     import signal

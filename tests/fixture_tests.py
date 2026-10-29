@@ -380,7 +380,7 @@ def test_js_response_time_excludes_render_wait():
     """Issue #93: response_time included js_wait_time, flagging every page."""
     if not _playwright_available():
         result('js response time excludes the render wait', True,
-               'skipped, playwright not installed')
+               'skipped, browser fixture disabled or Playwright unavailable')
         return
 
     site = BASE_PORT + 8
@@ -602,6 +602,8 @@ def test_empty_alt_is_not_missing_alt():
 
 
 def _playwright_available():
+    if os.environ.get('SKIP_BROWSER_TESTS') == '1':
+        return False
     try:
         import playwright  # noqa: F401
         return True

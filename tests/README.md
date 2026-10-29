@@ -58,3 +58,16 @@ It verifies, on every run:
 
 On failure it prints the poll history (sequence numbers, event counts, epoch
 changes) so the violation can be explained rather than just reported.
+
+## evidence_tests.py
+
+`python tests/evidence_tests.py` runs offline, browser-free fixtures for HTTP
+source bytes/text/headers and digest through SQLite and JSON export, failed-write
+retry without data loss/duplication, shared HTTP pacing, decoded-body caps and
+stream-read retries/response closure, bounded ancillary/gzip input, active-page
+reservations, stop/drain, failed-save cleanup/shutdown, and private bounded API admission.
+For the existing HTTP suite without its optional browser case, run:
+
+```bash
+SKIP_BROWSER_TESTS=1 python tests/fixture_tests.py
+```
