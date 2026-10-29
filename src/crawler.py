@@ -229,9 +229,7 @@ class WebCrawler:
                         not crawler._check_robots_txt(request.url)):
                     parsed = urlparse(request.url)
                     unavailable = crawler._robots_cache.get(f'{parsed.scheme}://{parsed.netloc}/robots.txt') is None
-                    error = RobotsAccessDenied(request.url, unavailable)
-                    crawler._record_acquisition_error(request.url, error)
-                    raise error
+                    raise RobotsAccessDenied(request.url, unavailable)
                 # Pace pages, redirects, robots/sitemaps and HEAD checks together.
                 if crawler.config.get('delay', 0) > 0 and crawler.rate_limiter:
                     crawler.rate_limiter.acquire()
@@ -1829,10 +1827,11 @@ class WebCrawler:
                     self._robots_cache[robots_url] = None
 
             rp = self._robots_cache[robots_url]
-            if rp is None:
-                return not self.private_http_service
             user_agent = self.config.get('user_agent', '*')
-            return rp.can_fetch(user_agent, url)
+            allowed = not self.private_http_service if rp is None else rp.can_fetch(user_agent, url)
+            if not allowed and self.private_http_service:
+                self._record_acquisition_error(url, RobotsAccessDenied(url, rp is None))
+            return allowed
 
         except Exception as e:
             if self.private_http_service:

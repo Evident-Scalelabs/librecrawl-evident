@@ -364,17 +364,23 @@ class EvidenceFixtures(unittest.TestCase):
 
     def test_private_http_policy_covers_head_redirects_sitemaps_and_unknown_robots(self):
         crawler = self.make_crawl(private_service=True)
+        crawler.config['respect_robots'] = True
         calls = []
 
         def respond(adapter, request, **kwargs):
             calls.append((request.method, request.url, request.headers['User-Agent'], kwargs.get('proxies')))
             response = requests.Response()
+            response.headers['Content-Type'] = 'text/html; charset=utf-8'
             response.url = request.url
             response.request = request
             response.status_code = 200
-            body = b'<html><title>Allowed</title></html>'
+            body = b'<html><title>Allowed</title><a href="/private/discovered">Private</a></html>'
             if request.url.endswith('/robots.txt'):
-                if 'unavailable.test' in request.url:
+                if 'policy-redirect.test' in request.url:
+                    response.status_code = 302
+                    response.headers['Location'] = '/policy'
+                    body = b''
+                elif 'unavailable.test' in request.url:
                     response.status_code = 503
                     body = b'unavailable'
                 elif 'missing.test' in request.url:
@@ -385,6 +391,8 @@ class EvidenceFixtures(unittest.TestCase):
                     body = b'Forbidden'
                 else:
                     body = b'User-agent: *\nDisallow: /private\nDisallow: /sitemap.xml\n'
+            elif request.url == 'https://policy-redirect.test/policy':
+                body = b'User-agent: *\nDisallow: /private\n'
             elif request.url.endswith('/redirect'):
                 response.status_code = 302
                 response.headers['Location'] = '/private'
@@ -406,17 +414,28 @@ class EvidenceFixtures(unittest.TestCase):
             forbidden = crawler._crawl_url_with_requests('https://forbidden.test/page', 0)
             self.assertEqual(forbidden['error_type'], 'robots_disallowed')
             self.assertEqual(crawler.session.get('https://missing.test/page').status_code, 200)
-            allowed = crawler.session.get(crawler.base_url + '/public')
-            self.assertEqual(allowed.status_code, 200)
+            allowed = crawler._crawl_url_with_requests(crawler.base_url + '/public', 0)
+            self.assertEqual(allowed['status_code'], 200)
+            self.assertEqual(crawler.session.get('https://policy-redirect.test/page').status_code, 200)
+            with self.assertRaises(RobotsAccessDenied):
+                crawler.session.get('https://policy-redirect.test/private')
         dispatched = [url for _, url, _, _ in calls]
         self.assertNotIn(crawler.base_url + '/private', dispatched)
         self.assertNotIn(crawler.base_url + '/sitemap.xml', dispatched)
         self.assertNotIn('https://unavailable.test/page', dispatched)
         self.assertNotIn('https://forbidden.test/page', dispatched)
+        self.assertNotIn(crawler.base_url + '/private/discovered', dispatched)
+        self.assertNotIn('https://policy-redirect.test/private', dispatched)
+        self.assertEqual(dispatched.count('https://policy-redirect.test/robots.txt'), 1)
+        self.assertIn('https://policy-redirect.test/policy', dispatched)
         self.assertEqual(dispatched.count('https://unavailable.test/robots.txt'), 1)
         self.assertTrue(all(agent == HTTP_USER_AGENT and not proxies for _, _, agent, proxies in calls))
         self.assertTrue(crawler._save_batch_to_db(force=True))
-        self.assertTrue(any('robots_disallowed' in issue['details'] for issue in crawl_db.load_crawl_issues(crawler.crawl_id)))
+        issues = crawl_db.load_crawl_issues(crawler.crawl_id)
+        discovered_gaps = [issue for issue in issues if issue['url'] == crawler.base_url + '/private/discovered'
+                           and issue['category'] == 'Acquisition']
+        self.assertEqual(len(discovered_gaps), 1)
+        self.assertIn('robots_disallowed', discovered_gaps[0]['details'])
 
     def test_private_entrypoint_requires_service_key_and_refuses_browser_work(self):
         with patch.dict(os.environ, {'LIBRECRAWL_API_KEY': 'fixture-service-key'}):
