@@ -25,7 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import requests
 from urllib3.response import HTTPResponse
 from src import auth_db, crawl_db
-from src.crawler import HTTP_USER_AGENT, RobotsAccessDenied, WebCrawler
+from src.crawler import HTTP_USER_AGENT, PRIVATE_HTTP_USER_AGENT, RobotsAccessDenied, WebCrawler
 from src.core.rate_limiter import RateLimiter
 
 
@@ -454,7 +454,7 @@ class EvidenceFixtures(unittest.TestCase):
         self.assertEqual(dispatched.count('https://policy-redirect.test/robots.txt'), 1)
         self.assertIn('https://policy-redirect.test/policy', dispatched)
         self.assertEqual(dispatched.count('https://unavailable.test/robots.txt'), 1)
-        self.assertTrue(all(agent == HTTP_USER_AGENT and not proxies for _, _, agent, proxies in calls))
+        self.assertTrue(all(agent == PRIVATE_HTTP_USER_AGENT and not proxies for _, _, agent, proxies in calls))
         self.assertTrue(crawler._save_batch_to_db(force=True))
         issues = crawl_db.load_crawl_issues(crawler.crawl_id)
         discovered_gaps = [issue for issue in issues if issue['url'] == crawler.base_url + '/private/discovered'
@@ -587,8 +587,10 @@ class EvidenceFixtures(unittest.TestCase):
         with patch.dict(os.environ, {'LIBRECRAWL_PRIVATE_SERVICE': 'false'}):
             settings = SettingsManager(tier='admin')
             self.assertTrue(settings.get_crawler_config()['enable_link_checks'])
+            self.assertEqual(settings.get_crawler_config()['user_agent'], HTTP_USER_AGENT)
             crawler = self.make_crawl()
         self.assertTrue(crawler.config['enable_link_checks'])
+        self.assertEqual(crawler.session.headers['User-Agent'], HTTP_USER_AGENT)
         crawler.config.pop('enable_link_checks')  # Historical upstream config remains enabled.
         calls = []
 
@@ -614,6 +616,51 @@ class EvidenceFixtures(unittest.TestCase):
             self.assertEqual(len(calls), 2)
         self.assertFalse(settings.save_settings({'enableLinkChecks': 'false'})[0])
 
+    def test_private_identity_obeys_evidentbot_group_on_shared_dispatch(self):
+        from src.settings_manager import SettingsManager
+        with patch.dict(os.environ, {'LIBRECRAWL_PRIVATE_SERVICE': 'true'}):
+            settings = SettingsManager(tier='admin')
+            self.assertEqual(settings.get_crawler_config()['user_agent'], PRIVATE_HTTP_USER_AGENT)
+        crawler = self.make_crawl(private_service=True)
+        self.assertEqual(crawler.config['user_agent'], PRIVATE_HTTP_USER_AGENT)
+        calls = []
+
+        def respond(adapter, request, **kwargs):
+            calls.append((request.method, request.url, request.headers['User-Agent']))
+            response = requests.Response()
+            response.url = request.url
+            response.request = request
+            response.status_code = 200
+            response.headers['Content-Type'] = 'text/html; charset=utf-8'
+            body = b'<html><title>Allowed</title></html>'
+            if request.url.endswith('/robots.txt'):
+                body = (b'User-agent: EvidentBot\nDisallow: /identity-denied\nDisallow: /sitemap.xml\n'
+                        b'\nUser-agent: *\nAllow: /\n')
+            elif request.url.endswith('/jump'):
+                response.status_code = 302
+                response.headers['Location'] = '/identity-denied'
+                body = b''
+            response.raw = HTTPResponse(body=io.BytesIO(body), preload_content=False)
+            return response
+
+        with patch.object(requests.adapters.HTTPAdapter, 'send', new=respond):
+            denied = crawler._crawl_url_with_requests(crawler.base_url + '/identity-denied', 0)
+            redirected = crawler._crawl_url_with_requests(crawler.base_url + '/jump', 0)
+            with self.assertRaises(RobotsAccessDenied):
+                crawler.session.head(crawler.base_url + '/identity-denied')
+            self.assertEqual(crawler.sitemap_parser._parse_sitemap(crawler.base_url + '/sitemap.xml'), [])
+            allowed = crawler._crawl_url_with_requests(crawler.base_url + '/allowed', 0)
+        for row in (denied, redirected):
+            self.assertEqual(row['status_code'], 0)
+            self.assertEqual(row['error_type'], 'robots_disallowed')
+            self.assertEqual(row['robots_reason'], 'rule_disallow')
+            self.assertEqual(row['robots_status'], 200)
+        self.assertEqual(allowed['status_code'], 200)
+        self.assertEqual([(method, url) for method, url, _ in calls],
+                         [('GET', crawler.base_url + '/robots.txt'),
+                          ('GET', crawler.base_url + '/jump'), ('GET', crawler.base_url + '/allowed')])
+        self.assertTrue(all(agent == PRIVATE_HTTP_USER_AGENT for _, _, agent in calls))
+
     def test_private_entrypoint_requires_service_key_and_refuses_browser_work(self):
         with patch.dict(os.environ, {'LIBRECRAWL_API_KEY': 'fixture-service-key',
                                      'LIBRECRAWL_PRIVATE_SERVICE': 'true'}):
@@ -626,8 +673,8 @@ class EvidenceFixtures(unittest.TestCase):
             headers = {'Authorization': 'Bearer fixture-service-key'}
             self.assertEqual(client.get('/', headers=headers).status_code, 404)
             self.assertEqual(client.get('/api/get_settings', headers=headers).status_code, 200)
-            self.assertEqual(client.get('/healthz').get_json()['requestPolicy']['userAgent'], HTTP_USER_AGENT)
-            for settings in ({'userAgent': 'Mozilla/5.0'}, {'respectRobotsTxt': False},
+            self.assertEqual(client.get('/healthz').get_json()['requestPolicy']['userAgent'], PRIVATE_HTTP_USER_AGENT)
+            for settings in ({'userAgent': 'Mozilla/5.0'}, {'userAgent': HTTP_USER_AGENT}, {'respectRobotsTxt': False},
                              {'enableProxy': True}, {'proxyUrl': 'http://proxy.invalid'},
                              {'customHeaders': 'User-Agent: Mozilla/5.0'}, {'enableLinkChecks': True},
                              {'enableLinkChecks': 'false'}, {'enableLinkChecks': 0}):
@@ -655,7 +702,7 @@ class EvidenceFixtures(unittest.TestCase):
             self.assertIn('max_file_size', rejected.get_json()['error'])
             bounded = WebCrawler()._get_default_config()
             bounded['max_file_size'] = 1024 * 1024
-            for overrides in ({'user_agent': 'Mozilla/5.0'}, {'respect_robots': False},
+            for overrides in ({'user_agent': 'Mozilla/5.0'}, {'user_agent': HTTP_USER_AGENT}, {'respect_robots': False},
                               {'enable_proxy': True}, {'custom_headers': {'User-Agent': 'Spoofed'}},
                               {'enable_link_checks': True}, {'enable_link_checks': 'false'}):
                 saved = crawl_db.create_crawl(None, 'old', 'https://example.test',

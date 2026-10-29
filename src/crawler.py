@@ -24,7 +24,7 @@ IMAGE_EXTENSIONS = {'jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'ico', 'avif', '
 
 # Parallel HEAD checks for images and (uncrawled) external links
 HEAD_CHECK_WORKERS = 5
-HTTP_USER_AGENT = 'LibreCrawl/1.0 (Web Crawler)'
+from src.settings_manager import HTTP_USER_AGENT, PRIVATE_HTTP_USER_AGENT
 
 
 class RobotsAccessDenied(Exception):
@@ -117,7 +117,7 @@ class WebCrawler:
             self.session.trust_env = False  # No ambient proxy or netrc identity.
         self._robots_fetch_state = threading.local()
         self.session.headers.update({
-            'User-Agent': HTTP_USER_AGENT
+            'User-Agent': self._get_default_config()['user_agent']
         })
         self._set_pool_size(self._get_default_config()['concurrency'])
 
@@ -301,7 +301,7 @@ class WebCrawler:
             'follow_redirects': True,
             'crawl_external': False,
             'enable_link_checks': not self.private_http_service,
-            'user_agent': HTTP_USER_AGENT,
+            'user_agent': PRIVATE_HTTP_USER_AGENT if self.private_http_service else HTTP_USER_AGENT,
             'timeout': 10,
             'retries': 3,
             'accept_language': 'en-US,en;q=0.9',

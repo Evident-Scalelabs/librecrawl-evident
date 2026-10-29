@@ -17,7 +17,7 @@ os.environ['LIBRECRAWL_PRIVATE_SERVICE'] = 'true'
 import main
 from flask import jsonify, request, session
 from src.crawl_db import get_crawl_by_id, get_db
-from src.crawler import HTTP_USER_AGENT
+from src.settings_manager import PRIVATE_HTTP_USER_AGENT as HTTP_USER_AGENT
 
 app = main.app
 

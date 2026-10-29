@@ -2,6 +2,9 @@ import json
 import os
 from pathlib import Path
 
+HTTP_USER_AGENT = 'LibreCrawl/1.0 (Web Crawler)'
+PRIVATE_HTTP_USER_AGENT = 'EvidentBot/1.0 (+https://evident.so/bot)'
+
 class SettingsManager:
     def __init__(self, session_id=None, user_id=None, tier='guest'):
         """
@@ -82,7 +85,8 @@ class SettingsManager:
             'enableLinkChecks': os.environ.get('LIBRECRAWL_PRIVATE_SERVICE') != 'true',
 
             # Request settings
-            'userAgent': 'LibreCrawl/1.0 (Web Crawler)',
+            'userAgent': (PRIVATE_HTTP_USER_AGENT if os.environ.get('LIBRECRAWL_PRIVATE_SERVICE') == 'true'
+                          else HTTP_USER_AGENT),
             'timeout': 10,
             'retries': 3,
             'acceptLanguage': 'en-US,en;q=0.9',
