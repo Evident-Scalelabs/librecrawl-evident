@@ -34,13 +34,26 @@ fail closed with explicit acquisition gaps. `robots_disallowed` and
 complete page capture. No identity rotation, browser impersonation or challenge
 evasion is provided by this entrypoint.
 
+Refused URL rows and `Acquisition` issues retain `robots_status` (observed HTTP
+status or null when no response was received), `robots_url`, `robots_final_url`
+(observed response URL, including redirects), and `robots_reason`. Reasons are
+`http_401_403` (the service's conservative policy), `rule_disallow` (the parsed
+robots rules deny this URL), `http_error`, `fetch_error`, or `body_limit`.
+The refused page's `status_code` stays 0; it is not the robots HTTP status.
+These fields survive SQLite reload and JSON exports, including discovery-only
+issues for URLs excluded before dispatch. Historical rows stay null/unknown;
+this does not reconstruct earlier refusals or add robots requests.
+
 The service starts idle. It does not crawl, render, query providers or invoke a
 model on startup. Supply no PageSpeed or other provider key.
 
 ## Existing HTTP API
 
-Use a separate cookie jar per crawl; the signed session cookie addresses its
-in-memory crawler. Keep the bearer secret server-side. Evident remains the
+The signed session cookie addresses its in-memory crawler. A serial client may
+reuse it after a crawl finishes: start refuses running/draining work, flushes the
+old crawl, and aborts on unsaved evidence before resetting memory. Retain or
+export each crawl's result before starting the next; historical rows remain
+addressable by `crawl_id`. Do not overlap crawls in one session. Keep the bearer secret server-side. Evident remains the
 tenant/scan authority and records the returned `crawl_id` under its owning job.
 
 1. `POST /api/save_settings` with explicit acquisition limits, for example
@@ -59,7 +72,7 @@ tenant/scan authority and records the returned `crawl_id` under its owning job.
    `/api/crawls/<id>/resume` path resumes interrupted work explicitly; startup
    recovery only marks interrupted crawls failed and never restarts acquisition.
 
-`GET /api/export_stream?format=json&type=urls&fields=url,final_url,status_code,error_type,body_base64,body_text,body_sha256,response_headers,fetched_at,capture_method`
+`GET /api/export_stream?format=json&type=urls&fields=url,final_url,status_code,error_type,robots_status,robots_url,robots_final_url,robots_reason,body_base64,body_text,body_sha256,response_headers,fetched_at,capture_method`
 streams the selected fields. The same fields work with the existing
 `POST /api/export_data` JSON export. Request fields explicitly: default exports
 are small SEO summaries.
@@ -104,7 +117,7 @@ fails. Cleanup only removes successfully drained and saved instances.
 `python tests/evidence_tests.py` checks exact bytes/text/headers/final URL through
 SQLite and JSON exports, retry-safe persistence, shared GET/HEAD/redirect pacing,
 decoded-body limits, stream failure/response closure, and private bounded
-HTTP-only API admission. The twelve cases include compressed ancillary limits,
+HTTP-only API admission. The thirteen cases include robots provenance/migration round-trips, compressed ancillary limits,
 active-page reservations, stop/drain and failed-save cleanup/shutdown.
 Policy fixtures also refuse spoofed settings/saved resumes and prove denied
 HEAD/redirect/sitemap requests and unknown robots never dispatch the page body.

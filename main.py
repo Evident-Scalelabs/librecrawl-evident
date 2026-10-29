@@ -507,7 +507,11 @@ def generate_issues_json_export(issues):
             'type': issue.get('type', ''),
             'category': issue.get('category', ''),
             'issue': issue.get('issue', ''),
-            'details': issue.get('details', '')
+            'details': issue.get('details', ''),
+            'robots_status': issue.get('robots_status'),
+            'robots_url': issue.get('robots_url'),
+            'robots_final_url': issue.get('robots_final_url'),
+            'robots_reason': issue.get('robots_reason')
         })
 
     return json.dumps({
@@ -1712,7 +1716,11 @@ def _stream_issues_json(issues):
             'type': issue.get('type', ''),
             'category': issue.get('category', ''),
             'issue': issue.get('issue', ''),
-            'details': issue.get('details', '')
+            'details': issue.get('details', ''),
+            'robots_status': issue.get('robots_status'),
+            'robots_url': issue.get('robots_url'),
+            'robots_final_url': issue.get('robots_final_url'),
+            'robots_reason': issue.get('robots_reason')
         }
         prefix = ',\n' if i > 0 else ''
         yield prefix + '    ' + json.dumps(entry, default=str)

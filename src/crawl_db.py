@@ -182,6 +182,14 @@ def init_crawl_tables():
             )
         ''')
 
+        # Refusal provenance belongs to the robots response, not the unfetched page.
+        for table in ('crawled_urls', 'crawl_issues'):
+            columns = {row['name'] for row in cursor.execute(f'PRAGMA table_info({table})')}
+            for name, kind in (('robots_status', 'INTEGER'), ('robots_url', 'TEXT'),
+                               ('robots_final_url', 'TEXT'), ('robots_reason', 'TEXT')):
+                if name not in columns:
+                    cursor.execute(f'ALTER TABLE {table} ADD COLUMN {name} {kind}')
+
         # Queue table for crash recovery
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS crawl_queue (
@@ -325,7 +333,9 @@ def save_url_batch(crawl_id, urls):
                     url_data.get('body_base64'), url_data.get('body_text'),
                     url_data.get('body_sha256'), json.dumps(url_data.get('response_headers')),
                     url_data.get('final_url'), url_data.get('fetched_at'),
-                    url_data.get('capture_method')
+                    url_data.get('capture_method'),
+                    url_data.get('robots_status'), url_data.get('robots_url'),
+                    url_data.get('robots_final_url'), url_data.get('robots_reason')
                 )
                 rows.append(row)
 
@@ -339,8 +349,9 @@ def save_url_batch(crawl_id, urls):
                     external_links, internal_links, response_time, javascript_rendered,
                     error_type, render_time, link_check_only,
                     body_base64, body_text, body_sha256, response_headers,
-                    final_url, fetched_at, capture_method
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    final_url, fetched_at, capture_method,
+                    robots_status, robots_url, robots_final_url, robots_reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', rows)
 
             print(f"Saved {len(urls)} URLs to database for crawl {crawl_id}")
@@ -406,14 +417,17 @@ def save_issues_batch(crawl_id, issues):
                     issue.get('type'),
                     issue.get('category'),
                     issue.get('issue'),
-                    issue.get('details')
+                    issue.get('details'),
+                    issue.get('robots_status'), issue.get('robots_url'),
+                    issue.get('robots_final_url'), issue.get('robots_reason')
                 )
                 rows.append(row)
 
             cursor.executemany('''
                 INSERT INTO crawl_issues (
-                    crawl_id, url, type, category, issue, details
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    crawl_id, url, type, category, issue, details,
+                    robots_status, robots_url, robots_final_url, robots_reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', rows)
 
             print(f"Saved {len(issues)} issues to database for crawl {crawl_id}")

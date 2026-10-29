@@ -389,6 +389,18 @@ class EvidenceFixtures(unittest.TestCase):
                 elif 'forbidden.test' in request.url:
                     response.status_code = 403
                     body = b'Forbidden'
+                elif 'unauthorized.test' in request.url:
+                    response.status_code = 401
+                    body = b'Unauthorized'
+                elif 'timeout.test' in request.url:
+                    raise requests.Timeout('fixture timeout')
+                elif 'oversized.test' in request.url:
+                    body = b'x' * 257
+                elif 'stream-failure.test' in request.url:
+                    def broken_body(**kwargs):
+                        raise requests.exceptions.ChunkedEncodingError('fixture truncated body')
+                        yield b''
+                    response.iter_content = broken_body
                 else:
                     body = b'User-agent: *\nDisallow: /private\nDisallow: /sitemap.xml\n'
             elif request.url == 'https://policy-redirect.test/policy':
@@ -413,12 +425,25 @@ class EvidenceFixtures(unittest.TestCase):
             self.assertEqual(unavailable['error_type'], 'robots_unavailable')
             forbidden = crawler._crawl_url_with_requests('https://forbidden.test/page', 0)
             self.assertEqual(forbidden['error_type'], 'robots_disallowed')
+            unauthorized = crawler._crawl_url_with_requests('https://unauthorized.test/page', 0)
+            timeout = crawler._crawl_url_with_requests('https://timeout.test/page', 0)
+            crawler.config['max_file_size'] = 256
+            oversized = crawler._crawl_url_with_requests('https://oversized.test/page', 0)
+            stream_failure = crawler._crawl_url_with_requests('https://stream-failure.test/page', 0)
+            crawler.config['max_file_size'] = 0
             self.assertEqual(crawler.session.get('https://missing.test/page').status_code, 200)
             allowed = crawler._crawl_url_with_requests(crawler.base_url + '/public', 0)
             self.assertEqual(allowed['status_code'], 200)
             self.assertEqual(crawler.session.get('https://policy-redirect.test/page').status_code, 200)
+            policy_redirect = crawler._crawl_url_with_requests('https://policy-redirect.test/private', 0)
+            denied = [redirected, unavailable, forbidden, unauthorized, timeout,
+                      oversized, stream_failure, policy_redirect]
+            # Cached refusals, including discovery, retain the same provenance and do not refetch.
+            for row in denied:
+                with self.assertRaises(RobotsAccessDenied):
+                    crawler.session.head(row['url'], allow_redirects=True)
             with self.assertRaises(RobotsAccessDenied):
-                crawler.session.get('https://policy-redirect.test/private')
+                crawler.session.head(crawler.base_url + '/private/discovered')
         dispatched = [url for _, url, _, _ in calls]
         self.assertNotIn(crawler.base_url + '/private', dispatched)
         self.assertNotIn(crawler.base_url + '/sitemap.xml', dispatched)
@@ -436,6 +461,73 @@ class EvidenceFixtures(unittest.TestCase):
                            and issue['category'] == 'Acquisition']
         self.assertEqual(len(discovered_gaps), 1)
         self.assertIn('robots_disallowed', discovered_gaps[0]['details'])
+        fields = ['robots_status', 'robots_url', 'robots_final_url', 'robots_reason']
+        expected = [(200, 'rule_disallow'), (503, 'http_error'), (403, 'http_401_403'),
+                    (401, 'http_401_403'), (None, 'fetch_error'), (200, 'body_limit'),
+                    (200, 'fetch_error'), (200, 'rule_disallow')]
+        for row, (status, reason) in zip(denied, expected):
+            with self.subTest(url=row['url']):
+                self.assertEqual(row['status_code'], 0)
+                self.assertEqual(row['robots_status'], status)
+                self.assertEqual(row['robots_reason'], reason)
+                self.assertFalse(row.get('body_base64'))
+                robots_url = row['robots_url']
+                self.assertEqual(dispatched.count(robots_url), 1)
+                if row is not redirected:
+                    self.assertNotIn(row['url'], dispatched)
+        self.assertIsNone(timeout['robots_final_url'])
+        self.assertEqual(policy_redirect['robots_final_url'], 'https://policy-redirect.test/policy')
+        self.assertEqual(discovered_gaps[0]['robots_status'], 200)
+        self.assertEqual(discovered_gaps[0]['robots_reason'], 'rule_disallow')
+        self.assertTrue(crawl_db.save_url_batch(crawler.crawl_id, denied))
+        restored = crawl_db.load_crawled_urls(crawler.crawl_id)
+        for actual, original in zip(restored, denied):
+            self.assertEqual({f: actual[f] for f in fields}, {f: original[f] for f in fields})
+        for output in (self.web.generate_json_export(restored, fields),
+                       ''.join(self.web._stream_urls_json(restored, fields))):
+            exported = json.loads(output)['data']
+            self.assertEqual(exported, [{f: row[f] for f in fields} for row in denied])
+        streamed_issues = json.loads(''.join(self.web._stream_issues_json(issues)))['data']
+        grouped_issues = json.loads(self.web.generate_issues_json_export(issues))['issues_by_url']
+        for issue in issues:
+            if issue.get('robots_url'):
+                projected = next(row for row in streamed_issues if row['url'] == issue['url']
+                                 and row['details'] == issue['details'])
+                grouped = next(row for row in grouped_issues[issue['url']]
+                               if row['details'] == issue['details'])
+                for projection in (projected, grouped):
+                    self.assertEqual({f: projection[f] for f in fields}, {f: issue[f] for f in fields})
+        # HTTP status/refusal provenance is retained by both public read routes after reload.
+        crawler.load_data(crawl_db.get_crawl_by_id(crawler.crawl_id), restored, [], issues)
+        with patch.object(self.web, 'get_or_create_crawler', return_value=crawler), \
+                patch.dict(os.environ, {'LIBRECRAWL_API_KEY': 'fixture-service-key'}):
+            client = self.web.app.test_client()
+            headers = {'Authorization': 'Bearer fixture-service-key'}
+            live = client.get('/api/crawl_status', headers=headers).get_json()
+            with client.session_transaction() as session:
+                actor = session['user_id']
+            with crawl_db.get_db() as connection:
+                connection.execute('UPDATE crawls SET user_id = ? WHERE id = ?',
+                                   (actor, crawler.crawl_id))
+            saved = client.get(f'/api/crawls/{crawler.crawl_id}', headers=headers).get_json()
+            for payload in (live, saved):
+                self.assertEqual(payload['urls'][2]['robots_status'], 403)
+                self.assertTrue(any(i.get('robots_reason') == 'rule_disallow' for i in payload['issues']))
+
+    def test_robots_columns_migrate_old_rows_without_inventing_evidence(self):
+        crawler = self.make_crawl()
+        fields = ['robots_status', 'robots_url', 'robots_final_url', 'robots_reason']
+        self.assertTrue(crawl_db.save_url_batch(crawler.crawl_id, [{'url': 'https://example.test/old'}]))
+        self.assertTrue(crawl_db.save_issues_batch(crawler.crawl_id, [{'url': 'https://example.test/old'}]))
+        with crawl_db.get_db() as connection:
+            for table in ('crawled_urls', 'crawl_issues'):
+                for field in fields:
+                    connection.execute(f'ALTER TABLE {table} DROP COLUMN {field}')
+        crawl_db.init_crawl_tables()
+        crawl_db.init_crawl_tables()  # Additive migration remains idempotent.
+        for row in (crawl_db.load_crawled_urls(crawler.crawl_id)[0],
+                    crawl_db.load_crawl_issues(crawler.crawl_id)[0]):
+            self.assertTrue(all(row[field] is None for field in fields))
 
     def test_private_entrypoint_requires_service_key_and_refuses_browser_work(self):
         with patch.dict(os.environ, {'LIBRECRAWL_API_KEY': 'fixture-service-key'}):

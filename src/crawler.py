@@ -28,8 +28,9 @@ HTTP_USER_AGENT = 'LibreCrawl/1.0 (Web Crawler)'
 
 
 class RobotsAccessDenied(Exception):
-    def __init__(self, url, unavailable):
+    def __init__(self, url, unavailable, evidence):
         self.error_type = 'robots_unavailable' if unavailable else 'robots_disallowed'
+        self.robots_evidence = evidence
         super().__init__(f'{self.error_type}: robots.txt does not permit acquisition of {url}')
 
 
@@ -228,8 +229,11 @@ class WebCrawler:
                         urlparse(request.url).path != '/robots.txt' and
                         not crawler._check_robots_txt(request.url)):
                     parsed = urlparse(request.url)
-                    unavailable = crawler._robots_cache.get(f'{parsed.scheme}://{parsed.netloc}/robots.txt') is None
-                    raise RobotsAccessDenied(request.url, unavailable)
+                    robots_url = f'{parsed.scheme}://{parsed.netloc}/robots.txt'
+                    parser, evidence = crawler._robots_cache.get(robots_url, (None, {
+                        'robots_url': robots_url, 'robots_status': None,
+                        'robots_final_url': None, 'robots_reason': 'fetch_error'}))
+                    raise RobotsAccessDenied(request.url, parser is None, evidence)
                 # Pace pages, redirects, robots/sitemaps and HEAD checks together.
                 if crawler.config.get('delay', 0) > 0 and crawler.rate_limiter:
                     crawler.rate_limiter.acquire()
@@ -260,10 +264,14 @@ class WebCrawler:
             fetched._content = bytes(body)
             fetched._content_consumed = True
             return fetched
+        except requests.RequestException as error:
+            # Keep the observed response when body streaming fails (including robots).
+            error.response = fetched
+            raise
         finally:
             fetched.close()
 
-    def _record_acquisition_error(self, url, error):
+    def _record_acquisition_error(self, url, error, robots_evidence=None):
         # Retain an explicit gap through the existing issue/event/DB owner.
         key = (url, str(error))
         with self.results_lock:
@@ -272,6 +280,7 @@ class WebCrawler:
             self._ancillary_error_keys.add(key)
             issue = {'url': url, 'type': 'warning', 'category': 'Acquisition',
                      'issue': 'Ancillary capture incomplete', 'details': str(error)}
+            issue.update(robots_evidence or getattr(error, 'robots_evidence', {}))
             with self.issue_detector.issues_lock:
                 self.issue_detector.detected_issues.append(issue)
             self.event_log.emit('issue', issue)
@@ -1333,10 +1342,13 @@ class WebCrawler:
             })
             return result
         except Exception as e:
-            return self.seo_extractor.create_empty_result(
+            result = self.seo_extractor.create_empty_result(
                 url, depth, 0, str(e),
                 error_type=e.error_type if isinstance(e, RobotsAccessDenied) else classify_fetch_error(e)
             )
+            if isinstance(e, RobotsAccessDenied):
+                result.update(e.robots_evidence)
+            return result
         finally:
             if response is not None:
                 response.close()
@@ -1802,6 +1814,8 @@ class WebCrawler:
             if robots_url not in self._robots_cache:
                 rp = RobotFileParser()
                 rp.set_url(robots_url)
+                evidence = {'robots_url': robots_url, 'robots_status': None,
+                            'robots_final_url': None, 'robots_reason': None}
                 try:
                     # Fetch robots.txt with our session (proper User-Agent)
                     # instead of rp.read() which uses urllib with Python's
@@ -1812,25 +1826,36 @@ class WebCrawler:
                         response = self.session.get(robots_url, timeout=10)
                     finally:
                         self._robots_fetch_state.active = False
+                    evidence.update(robots_status=response.status_code, robots_final_url=response.url)
                     if response.status_code in (401, 403):
+                        evidence['robots_reason'] = 'http_401_403'
                         rp.disallow_all = True
                     elif (self.private_http_service and response.status_code >= 400
                           and response.status_code not in (404, 410)):
-                        raise requests.HTTPError(f'robots.txt unavailable: HTTP {response.status_code}')
+                        raise requests.HTTPError(f'robots.txt unavailable: HTTP {response.status_code}', response=response)
                     elif response.status_code >= 400:
                         rp.allow_all = True
                     else:
                         rp.parse(response.text.splitlines())
-                    self._robots_cache[robots_url] = rp
+                        # Used only for denied URLs; allowed paths have no refusal row.
+                        evidence['robots_reason'] = 'rule_disallow'
                 except Exception as e:
-                    self._record_acquisition_error(robots_url, e)
-                    self._robots_cache[robots_url] = None
+                    failed_response = getattr(e, 'response', None)
+                    if failed_response is not None:
+                        evidence.update(robots_status=failed_response.status_code,
+                                        robots_final_url=failed_response.url)
+                    evidence['robots_reason'] = ('body_limit' if isinstance(e, HTTPBodyTooLarge)
+                                                 else 'http_error' if isinstance(e, requests.HTTPError)
+                                                 else 'fetch_error')
+                    self._record_acquisition_error(robots_url, e, evidence)
+                    rp = None
+                self._robots_cache[robots_url] = (rp, evidence)
 
-            rp = self._robots_cache[robots_url]
+            rp, evidence = self._robots_cache[robots_url]
             user_agent = self.config.get('user_agent', '*')
             allowed = not self.private_http_service if rp is None else rp.can_fetch(user_agent, url)
             if not allowed and self.private_http_service:
-                self._record_acquisition_error(url, RobotsAccessDenied(url, rp is None))
+                self._record_acquisition_error(url, RobotsAccessDenied(url, rp is None, evidence))
             return allowed
 
         except Exception as e:
