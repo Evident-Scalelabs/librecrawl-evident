@@ -67,7 +67,8 @@ def require_service_key():
 def health():
     with get_db() as connection:
         connection.execute('SELECT 1')
-    return jsonify({'status': 'ok', 'capture_method': 'http'})
+    return jsonify({'status': 'ok', 'capture_method': 'http',
+                    'producerRevision': os.environ.get('RAILWAY_GIT_COMMIT_SHA')})
 
 
 if __name__ == '__main__':
@@ -82,4 +83,5 @@ if __name__ == '__main__':
         if not session.get('user_id'):
             raise RuntimeError('Could not initialize the private service account')
     main.start_cleanup_thread()
-    serve(app, host='::', port=int(os.environ.get('PORT', '5000')), threads=8)
+    # Waitress explicitly sets IPV6_V6ONLY; wildcard listen binds both families.
+    serve(app, listen=f"*:{int(os.environ.get('PORT', '5000'))}", threads=8)
