@@ -349,6 +349,8 @@ class EvidenceFixtures(unittest.TestCase):
             service = importlib.import_module('service')
             client = service.app.test_client()
             self.assertEqual(client.get('/healthz').status_code, 200)
+            with patch.dict(os.environ, {'RAILWAY_GIT_COMMIT_SHA': 'a' * 40}):
+                self.assertEqual(client.get('/healthz').get_json()['producerRevision'], 'a' * 40)
             self.assertEqual(client.get('/api/get_settings').status_code, 401)
             headers = {'Authorization': 'Bearer fixture-service-key'}
             self.assertEqual(client.get('/', headers=headers).status_code, 404)

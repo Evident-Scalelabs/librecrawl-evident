@@ -15,6 +15,8 @@ a separate stable Flask session signing secret. Set `PORT=5000`. Keep one servic
 replica: active crawls live in one Python process and SQLite owns durable rows.
 Mount a Railway volume at `/app/data` so `data/users.db` survives redeployments.
 Use private networking only, with no public domain. `/healthz` checks SQLite;
+health includes `producerRevision` from Railway’s source commit identity (null locally).
+Waitress listens on both IPv4 and IPv6 for health checks and private networking;
 all `/api/*` requests require `Authorization: Bearer <service key>`. UI and
 login routes return 404. There is no external identity provider or customer login.
 
