@@ -136,6 +136,13 @@ def init_crawl_tables():
         except sqlite3.OperationalError:
             pass  # Column already exists
 
+        # Retain source evidence with the page metadata it produced.
+        columns = {row['name'] for row in cursor.execute('PRAGMA table_info(crawled_urls)')}
+        for name in ('body_base64', 'body_text', 'body_sha256', 'response_headers',
+                     'final_url', 'fetched_at', 'capture_method'):
+            if name not in columns:
+                cursor.execute(f'ALTER TABLE crawled_urls ADD COLUMN {name} TEXT')
+
         # Links table
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS crawl_links (
@@ -314,7 +321,11 @@ def save_url_batch(crawl_id, urls):
                     url_data.get('javascript_rendered', False),
                     url_data.get('error_type'),
                     url_data.get('render_time'),
-                    url_data.get('link_check_only', False)
+                    url_data.get('link_check_only', False),
+                    url_data.get('body_base64'), url_data.get('body_text'),
+                    url_data.get('body_sha256'), json.dumps(url_data.get('response_headers')),
+                    url_data.get('final_url'), url_data.get('fetched_at'),
+                    url_data.get('capture_method')
                 )
                 rows.append(row)
 
@@ -326,8 +337,10 @@ def save_url_batch(crawl_id, urls):
                     meta_tags, og_tags, twitter_tags, json_ld, analytics, images,
                     hreflang, schema_org, redirects, linked_from,
                     external_links, internal_links, response_time, javascript_rendered,
-                    error_type, render_time, link_check_only
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    error_type, render_time, link_check_only,
+                    body_base64, body_text, body_sha256, response_headers,
+                    final_url, fetched_at, capture_method
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', rows)
 
             print(f"Saved {len(urls)} URLs to database for crawl {crawl_id}")
@@ -531,7 +544,7 @@ def load_crawled_urls(crawl_id, limit=None, offset=0):
                 # Parse JSON fields
                 for field in ['h2', 'h3', 'meta_tags', 'og_tags', 'twitter_tags',
                              'json_ld', 'analytics', 'images', 'hreflang',
-                             'schema_org', 'redirects', 'linked_from']:
+                             'schema_org', 'redirects', 'linked_from', 'response_headers']:
                     if url_data.get(field):
                         try:
                             url_data[field] = json.loads(url_data[field])

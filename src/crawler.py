@@ -3,6 +3,9 @@ Main web crawler orchestrator with smooth rate limiting and modular architecture
 Refactored for better code practices and maintainability.
 """
 import requests
+import base64
+import hashlib
+from datetime import datetime, timezone
 import socket
 import ssl
 import threading
@@ -20,6 +23,16 @@ IMAGE_EXTENSIONS = {'jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'ico', 'avif', '
 
 # Parallel HEAD checks for images and (uncrawled) external links
 HEAD_CHECK_WORKERS = 5
+
+
+class HTTPBodyTooLarge(Exception):
+    """A decoded response exceeded the capture limit; its body is unusable."""
+
+    def __init__(self, response, observed_size, limit):
+        self.response = response
+        self.observed_size = observed_size
+        super().__init__(f'Decoded body exceeds {limit} bytes; stopped after '
+                         f'{observed_size} bytes, body not retained or analyzed')
 
 
 def classify_fetch_error(exc_or_msg):
@@ -130,6 +143,13 @@ class WebCrawler:
 
         # Configuration
         self.config = self._get_default_config()
+        self.session.hooks['response'] = [self._read_bounded_http_body]
+        self._ancillary_error_keys = set()
+        self._state_lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._stop_requested = False
+        self._active_fetches = 0
+        self.sitemap_thread = None
 
         # Statistics
         self.stats = {
@@ -167,6 +187,8 @@ class WebCrawler:
         self.unsaved_links = []
         self.unsaved_issues = []
         self._batch_lock = threading.Lock()
+        self._save_lock = threading.Lock()
+        self.persistence_error = None
         self.auto_save_thread = None
         self.db_save_enabled = False  # Only enable when crawl_id is set
 
@@ -183,10 +205,59 @@ class WebCrawler:
         paying a fresh TCP and TLS handshake for the next request to that host.
         """
         size = max(10, int(concurrency) + HEAD_CHECK_WORKERS + 5)
-        adapter = requests.adapters.HTTPAdapter(
+        crawler = self
+
+        class PacedHTTPAdapter(requests.adapters.HTTPAdapter):
+            def send(self, request, **kwargs):
+                # Pace pages, redirects, robots/sitemaps and HEAD checks together.
+                if crawler.config.get('delay', 0) > 0 and crawler.rate_limiter:
+                    crawler.rate_limiter.acquire()
+                return super().send(request, **kwargs)
+
+        adapter = PacedHTTPAdapter(
             pool_connections=size, pool_maxsize=size, max_retries=0)
         self.session.mount('http://', adapter)
         self.session.mount('https://', adapter)
+
+    def _read_bounded_http_body(self, fetched, **kwargs):
+        # The session hook also runs for robots, sitemaps and every redirect,
+        # before requests can eagerly consume a body. Bound decoded bytes.
+        max_size = self.config.get('max_file_size', 0)
+        body = bytearray()
+        chunk_size = min(64 * 1024, int(max_size) + 1) if max_size > 0 else 64 * 1024
+        try:
+            for chunk in fetched.iter_content(chunk_size=chunk_size):
+                if not chunk:
+                    continue
+                observed_size = len(body) + len(chunk)
+                if max_size > 0 and observed_size > max_size:
+                    raise HTTPBodyTooLarge(fetched, observed_size, max_size)
+                body.extend(chunk)
+            fetched._content = bytes(body)
+            fetched._content_consumed = True
+            return fetched
+        finally:
+            fetched.close()
+
+    def _record_acquisition_error(self, url, error):
+        # Retain an explicit gap through the existing issue/event/DB owner.
+        key = (url, str(error))
+        with self.results_lock:
+            if key in self._ancillary_error_keys:
+                return
+            self._ancillary_error_keys.add(key)
+            issue = {'url': url, 'type': 'warning', 'category': 'Acquisition',
+                     'issue': 'Ancillary capture incomplete', 'details': str(error)}
+            with self.issue_detector.issues_lock:
+                self.issue_detector.detected_issues.append(issue)
+            self.event_log.emit('issue', issue)
+            self.user_memory.track_issues([issue])
+            if self.db_save_enabled:
+                self.unsaved_issues.append(issue)
+
+    def _has_live_threads(self):
+        return any(thread and thread.is_alive() for thread in
+                   (self.crawl_thread, self.sitemap_thread, self.auto_save_thread))
 
     def _get_default_config(self):
         """Get default configuration"""
@@ -302,8 +373,11 @@ class WebCrawler:
 
     def start_crawl(self, url, user_id=None, session_id=None):
         """Start crawling from the given URL"""
-        if self.is_running:
-            return False, "Crawl already in progress"
+        if self.is_running or self._has_live_threads():
+            return False, "Previous crawl is still running or draining"
+
+        if not self._save_batch_to_db(force=True):
+            return False, "Previous crawl still has unsaved evidence"
 
         try:
             # Validate and normalize URL
@@ -324,9 +398,10 @@ class WebCrawler:
                     base_domain=self.base_domain,
                     config_snapshot=self.config
                 )
-                if self.crawl_id:
-                    self.db_save_enabled = True
-                    print(f"Database persistence enabled for crawl {self.crawl_id}")
+                if not self.crawl_id:
+                    return False, "Could not create durable crawl record"
+                self.db_save_enabled = True
+                print(f"Database persistence enabled for crawl {self.crawl_id}")
 
             # Initialize components
             self._initialize_components()
@@ -338,20 +413,22 @@ class WebCrawler:
             self.link_manager.add_url(url, 0)
             self.stats['discovered'] = 1
 
+            self.is_running = True
+
             # Discover sitemaps in the background so the crawl (and the UI)
             # starts immediately — sitemap probes can take many seconds on
             # slow sites and used to block this request until they finished
             if self.config.get('discover_sitemaps', True):
                 self._sitemap_discovery_done = False
-                threading.Thread(target=self._discover_sitemaps_background,
-                                 args=(url,), daemon=True).start()
+                self.sitemap_thread = threading.Thread(
+                    target=self._discover_sitemaps_background, args=(url,), daemon=True)
+                self.sitemap_thread.start()
 
             # Start auto-save thread if DB enabled
             if self.db_save_enabled:
                 self._start_auto_save_thread()
 
             # Start crawling in separate thread
-            self.is_running = True
             self.crawl_thread = threading.Thread(target=self._crawl_worker)
             self.crawl_thread.start()
 
@@ -371,7 +448,11 @@ class WebCrawler:
 
         self.rate_limiter = RateLimiter(requests_per_second)
         self.link_manager = LinkManager(self.base_domain, event_log=self.event_log)
-        self.sitemap_parser = SitemapParser(self.session, self.base_domain, self.config['timeout'])
+        self.sitemap_parser = SitemapParser(
+            self.session, self.base_domain, self.config['timeout'],
+            max_file_size=self.config.get('max_file_size', 0),
+            on_error=self._record_acquisition_error,
+            should_continue=lambda: not self._stop_event.is_set())
         self.issue_detector = IssueDetector(self.config.get('issue_exclusion_patterns', []))
 
         # Initialize JS renderer if needed
@@ -402,7 +483,12 @@ class WebCrawler:
         self.memory_monitor.start_monitoring()
         self.user_memory.reset()
         self._demo_limit_reached = False
+        self.persistence_error = None
         self._sitemap_discovery_done = True
+        self._ancillary_error_keys.clear()
+        self._stop_requested = False
+        self._stop_event.clear()
+        self._active_fetches = 0
 
     def _discover_sitemaps_background(self, base_url):
         """Run sitemap discovery off the request thread; the completion
@@ -412,6 +498,7 @@ class WebCrawler:
             self._discover_and_add_sitemap_urls(base_url)
             print(f"Sitemap discovery completed. Total discovered URLs: {self.stats['discovered']}")
         except Exception as e:
+            self._record_acquisition_error(base_url, e)
             print(f"Sitemap discovery error: {e}")
         finally:
             self._sitemap_discovery_done = True
@@ -424,6 +511,8 @@ class WebCrawler:
         filtered_count = 0
 
         for url in sitemap_urls:
+            if self._stop_event.is_set():
+                break
             if self._should_crawl_url(url):
                 self.link_manager.add_url(url, 0)
                 added_count += 1
@@ -433,41 +522,46 @@ class WebCrawler:
         self.stats['discovered'] = self.link_manager.get_stats()['discovered']
         print(f"Sitemap processing: {added_count} added, {filtered_count} filtered")
 
-    def stop_crawl(self):
-        """Stop the current crawl"""
-        self.is_running = False
-        self.is_paused = False
-        self.is_running_pagespeed = False
+    def stop_crawl(self, wait_timeout=5):
+        """Stop dispatch, drain acquired work, then persist; never discard a live owner."""
+        with self._state_lock:
+            self._stop_requested = True
+            self._stop_event.set()
+            self.is_running = False
+            self.is_paused = False
+            self.is_running_pagespeed = False
 
-        if self.crawl_thread and self.crawl_thread.is_alive():
-            self.crawl_thread.join(timeout=5)
+        for thread in (self.crawl_thread, self.sitemap_thread, self.auto_save_thread):
+            if thread and thread.is_alive() and thread is not threading.current_thread():
+                thread.join(timeout=wait_timeout)
+        if self._has_live_threads():
+            return False, "Stop requested; acquisition/persistence is still draining"
 
-        # Save final data to database
+        saved = self._save_batch_to_db(force=True)
         if self.db_save_enabled and self.crawl_id:
-            self._save_batch_to_db(force=True)
             from src.crawl_db import get_crawl_by_id, set_crawl_status
             crawl = get_crawl_by_id(self.crawl_id)
-            # Don't overwrite 'completed' status (e.g. from cleanup thread)
             if crawl and crawl['status'] != 'completed':
-                set_crawl_status(self.crawl_id, 'stopped')
+                set_crawl_status(self.crawl_id, 'stopped' if saved else 'failed')
 
-        # Clean up JavaScript resources if enabled
         if self.js_renderer:
             asyncio.run(self.js_renderer.cleanup())
             self.js_renderer = None
-
-        return True, "Crawl and PageSpeed analysis stopped"
+        return saved, "Crawl drained and saved" if saved else self.persistence_error
 
     def pause_crawl(self):
         """Pause the current crawl"""
         if not self.is_running:
             return False, "No crawl in progress"
-        self.is_paused = True
+        with self._state_lock:
+            self.is_paused = True
+            if self._active_fetches or (self.sitemap_thread and self.sitemap_thread.is_alive()):
+                return False, "Pause requested; acquisition is still draining"
 
-        # Save checkpoint when pausing
+        # Save checkpoint only once admitted requests have drained.
         if self.db_save_enabled and self.crawl_id:
-            self._save_batch_to_db(force=True)
-            self._save_queue_checkpoint()
+            if not self._save_batch_to_db(force=True) or not self._save_queue_checkpoint():
+                return False, "Crawl paused in memory but its checkpoint could not be saved"
             from src.crawl_db import set_crawl_status
             set_crawl_status(self.crawl_id, 'paused')
 
@@ -479,7 +573,8 @@ class WebCrawler:
             return False, "No crawl in progress"
         if not self.is_paused:
             return False, "Crawl is not paused"
-        self.is_paused = False
+        with self._state_lock:
+            self.is_paused = False
 
         # Update status in database
         if self.db_save_enabled and self.crawl_id:
@@ -490,8 +585,11 @@ class WebCrawler:
 
     def resume_from_database(self, crawl_id, user_id=None, session_id=None):
         """Resume a previously interrupted crawl from database"""
-        if self.is_running:
-            return False, "Crawl already in progress"
+        if self.is_running or self._has_live_threads():
+            return False, "Previous crawl is still running or draining"
+
+        if not self._save_batch_to_db(force=True):
+            return False, "Current crawl still has unsaved evidence"
 
         try:
             from src.crawl_db import get_resume_data, load_crawled_urls, set_crawl_status
@@ -620,11 +718,14 @@ class WebCrawler:
             # Update status to running
             set_crawl_status(crawl_id, 'running')
 
+            self._stop_requested = False
+            self._stop_event.clear()
+            self.is_running = True
+
             # Start auto-save thread
             self._start_auto_save_thread()
 
             # Start crawling
-            self.is_running = True
             self.crawl_thread = threading.Thread(target=self._crawl_worker)
             self.crawl_thread.start()
 
@@ -642,6 +743,10 @@ class WebCrawler:
         Rebuilds the event log under a new epoch, so any polling client
         drops its accumulated state and replays the loaded data.
         """
+        if self.is_running or self._has_live_threads():
+            raise RuntimeError("Current crawl is still running or draining")
+        if not self._save_batch_to_db(force=True):
+            raise OSError("Current crawl still has unsaved evidence")
         self.base_url = crawl['base_url']
         self.base_domain = crawl['base_domain']
 
@@ -682,7 +787,15 @@ class WebCrawler:
     def get_status_light(self):
         """Current status, stats and progress — without the data arrays.
         Data reaches polling clients through the event log instead."""
-        if self._demo_limit_reached and not self.is_running:
+        if self._stop_requested and self._has_live_threads():
+            status = 'stopping'
+        elif self.persistence_error and not self.is_running:
+            status = 'failed'
+        elif self._stop_requested and not self.is_running:
+            status = 'stopped'
+        elif self.is_paused:
+            status = 'pausing' if self._active_fetches or (self.sitemap_thread and self.sitemap_thread.is_alive()) else 'paused'
+        elif self._demo_limit_reached and not self.is_running:
             status = 'demo_stopped'
         elif not self.is_running and self.stats['crawled'] > 0:
             status = 'completed'
@@ -721,7 +834,8 @@ class WebCrawler:
             'memory': self.memory_monitor.get_stats(),
             'memory_data': data_sizes,
             'demo_stopped': self._demo_limit_reached,
-            'demo_mode': self.config.get('demo_mode', False)
+            'demo_mode': self.config.get('demo_mode', False),
+            'persistence_error': self.persistence_error
         }
 
     def get_status(self):
@@ -733,61 +847,51 @@ class WebCrawler:
         return status_data
 
     def _save_batch_to_db(self, force=False):
-        """Save batched data to database"""
+        """Only remove committed rows; serialize flushes while crawl workers append."""
         if not self.db_save_enabled or not self.crawl_id:
-            return
+            return True
 
         from src.crawl_db import save_url_batch, save_links_batch, save_issues_batch, update_crawl_stats
 
-        # Take the pending batches before touching the database. Crawl workers
-        # keep appending during the write and the auto-save thread can run this
-        # concurrently with the worker, so clearing the lists after the write
-        # silently dropped everything appended in between. Each list keeps its
-        # identity and only the rows actually taken are removed, so appends that
-        # land mid-write survive and go out with the next batch.
-        def take(batch):
-            with self._batch_lock:
-                taken = batch[:]
-                del batch[:len(taken)]
-            return taken
+        with self._save_lock:
+            saved = True
+            for batch, writer, name in ((self.unsaved_urls, save_url_batch, 'pages'),
+                                        (self.unsaved_links, save_links_batch, 'links'),
+                                        (self.unsaved_issues, save_issues_batch, 'issues')):
+                with self._batch_lock:
+                    pending = batch[:]
+                if not pending:
+                    continue
+                try:
+                    committed = writer(self.crawl_id, pending)
+                except Exception as error:
+                    print(f"Error saving {name}: {error}")
+                    committed = False
+                if committed:
+                    with self._batch_lock:
+                        del batch[:len(pending)]
+                else:
+                    self.persistence_error = f'Could not persist crawl {name}; pending rows retained for retry'
+                    print(self.persistence_error)
+                    saved = False
 
-        urls = take(self.unsaved_urls)
-        links = take(self.unsaved_links)
-        issues = take(self.unsaved_issues)
-
-        try:
-            if urls:
-                save_url_batch(self.crawl_id, urls)
-
-            if links:
-                save_links_batch(self.crawl_id, links)
-
-            if issues:
-                save_issues_batch(self.crawl_id, issues)
-
-            # Update statistics
             memory_stats = self.memory_monitor.get_stats()
-            update_crawl_stats(
-                self.crawl_id,
-                discovered=self.stats['discovered'],
-                crawled=self.stats['crawled'],
-                max_depth=self.stats['depth'],
-                peak_memory_mb=memory_stats.get('peak_mb', 0),
-                estimated_size_mb=memory_stats.get('estimated_crawl_mb', 0)
-            )
-
-            self.last_save_time = time.time()
-            print(f"Saved batch to database for crawl {self.crawl_id}")
-
-        except Exception as e:
-            print(f"Error saving batch to database: {e}")
-            import traceback
-            traceback.print_exc()
+            if not update_crawl_stats(
+                    self.crawl_id, discovered=self.stats['discovered'],
+                    crawled=self.stats['crawled'], max_depth=self.stats['depth'],
+                    peak_memory_mb=memory_stats.get('peak_mb', 0),
+                    estimated_size_mb=memory_stats.get('estimated_crawl_mb', 0)):
+                self.persistence_error = 'Could not persist crawl statistics'
+                saved = False
+            if saved:
+                self.last_save_time = time.time()
+                self.persistence_error = None
+            return saved
 
     def _save_queue_checkpoint(self):
         """Save current queue state for crash recovery"""
         if not self.db_save_enabled or not self.crawl_id or not self.link_manager:
-            return
+            return True
 
         from src.crawl_db import save_checkpoint
 
@@ -808,20 +912,28 @@ class WebCrawler:
                 'pending_count': self.link_manager.get_stats().get('pending', 0)
             }
 
-            save_checkpoint(self.crawl_id, checkpoint)
+            if not save_checkpoint(self.crawl_id, checkpoint):
+                self.persistence_error = 'Could not persist crawl checkpoint'
+                return False
             print(f"Saved queue checkpoint for crawl {self.crawl_id}")
+            return True
 
         except Exception as e:
-            print(f"Error saving checkpoint: {e}")
+            self.persistence_error = f'Could not persist crawl checkpoint: {e}'
+            print(self.persistence_error)
+            return False
 
     def _start_auto_save_thread(self):
         """Background thread for periodic saves"""
         def auto_save_worker():
             while self.is_running:
-                time.sleep(5)  # Check every 5 seconds
+                if self._stop_event.wait(5):
+                    return
+                if not self.is_running:
+                    return
                 if time.time() - self.last_save_time >= self.auto_save_interval:
-                    self._save_batch_to_db()
-                    self._save_queue_checkpoint()
+                    if self._save_batch_to_db():
+                        self._save_queue_checkpoint()
 
         self.auto_save_thread = threading.Thread(target=auto_save_worker, daemon=True)
         self.auto_save_thread.start()
@@ -829,7 +941,11 @@ class WebCrawler:
 
     def update_config(self, new_config):
         """Update crawler configuration"""
+        if self._stop_requested and self._has_live_threads():
+            raise RuntimeError("Cannot replace configuration while acquisition is draining")
         self.config.update(new_config)
+        if self.sitemap_parser:
+            self.sitemap_parser.max_file_size = self.config.get('max_file_size', 0)
 
         # Update session headers
         self.session.headers.update({
@@ -874,31 +990,29 @@ class WebCrawler:
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             active_futures = {}
 
-            while self.is_running:
+            while self.is_running or active_futures:
                 try:
-                    # Check if paused
-                    if self.is_paused:
-                        time.sleep(1)
+                    # Pausing stops dispatch; admitted work still reaches persistence.
+                    if self.is_paused and not active_futures:
+                        time.sleep(0.05)
                         continue
 
-                    # Submit new tasks - fill ALL available slots, apply rate limiting per task
-                    while (len(active_futures) < max_workers and
-                           self.pages_crawled < self.config['max_urls']):
-
-                        url_info = self.link_manager.get_next_url()
-                        if not url_info:
-                            break
-
-                        current_url, depth = url_info
-
-                        # Skip if depth exceeded
-                        if depth > self.config['max_depth']:
-                            continue
-
-                        # Submit crawl task immediately - rate limiting happens inside the worker
-                        print(f"Submitting task for: {current_url}")
-                        future = executor.submit(self._crawl_url, current_url, depth)
-                        active_futures[future] = current_url
+                    while len(active_futures) < max_workers:
+                        with self._state_lock:
+                            # A future reserves one page until result admission.
+                            if (not self.is_running or self.is_paused or
+                                    self.pages_crawled + len(active_futures) >= self.config['max_urls']):
+                                break
+                            url_info = self.link_manager.get_next_url()
+                            if not url_info:
+                                break
+                            current_url, depth = url_info
+                            if depth > self.config['max_depth']:
+                                continue
+                            print(f"Submitting task for: {current_url}")
+                            future = executor.submit(self._crawl_url, current_url, depth)
+                            active_futures[future] = current_url
+                            self._active_fetches = len(active_futures)
 
                     # Process completed tasks
                     completed_futures = []
@@ -921,18 +1035,19 @@ class WebCrawler:
                                     # Track per-user memory
                                     self.user_memory.track_url(result)
 
-                                    # Detect issues
-                                    issues_before = len(self.issue_detector.detected_issues)
-                                    self.issue_detector.detect_issues(result)
-                                    issues_after = len(self.issue_detector.detected_issues)
+                                    with self.results_lock:
+                                        # Detect issues
+                                        issues_before = len(self.issue_detector.detected_issues)
+                                        self.issue_detector.detect_issues(result)
+                                        issues_after = len(self.issue_detector.detected_issues)
 
-                                    # Track + batch new issues
-                                    if issues_after > issues_before:
-                                        new_issues = self.issue_detector.detected_issues[issues_before:issues_after]
-                                        self.event_log.emit_many('issue', new_issues)
-                                        self.user_memory.track_issues(new_issues)
-                                        if self.db_save_enabled:
-                                            self.unsaved_issues.extend(new_issues)
+                                        # Track + batch new issues
+                                        if issues_after > issues_before:
+                                            new_issues = self.issue_detector.detected_issues[issues_before:issues_after]
+                                            self.event_log.emit_many('issue', new_issues)
+                                            self.user_memory.track_issues(new_issues)
+                                            if self.db_save_enabled:
+                                                self.unsaved_issues.extend(new_issues)
 
                                     if (self.db_save_enabled and
                                             len(self.unsaved_urls) >= self.batch_save_size):
@@ -941,18 +1056,21 @@ class WebCrawler:
                                 print(f"Error in crawl task: {e}")
 
                     # Remove completed futures
-                    for future in completed_futures:
-                        del active_futures[future]
+                    with self._state_lock:
+                        for future in completed_futures:
+                            del active_futures[future]
+                        self._active_fetches = len(active_futures)
 
                     # Demo mode: check per-user memory limit
                     if self.config.get('demo_mode') and self.user_memory.total_bytes >= self.config.get('demo_memory_limit_bytes', 0):
                         print(f"DEMO MODE: Per-user memory limit reached ({self.user_memory.total_mb:.0f}MB)")
                         self._demo_limit_reached = True
-                        break
+                        self.is_running = False
+                        self._stop_event.set()
 
-                    # Check for completion
-                    if self.pages_crawled >= self.config['max_urls']:
-                        print(f"Reached maximum URLs limit ({self.config['max_urls']})")
+                    # Stop/cap only ends once every reserved result is retained.
+                    if not active_futures and (not self.is_running or
+                                                self.pages_crawled >= self.config['max_urls']):
                         break
 
                     # Check if no more work (sitemap discovery may still be
@@ -972,8 +1090,13 @@ class WebCrawler:
                     print(f"Error in crawl worker: {e}")
                     time.sleep(1)
 
-        # Skip post-processing if demo limit was hit — no further memory use
-        if not self._demo_limit_reached:
+        # Ancillary work must finish its last bounded request before final save.
+        self._stop_event.set()
+        if self.sitemap_thread and self.sitemap_thread.is_alive():
+            self.sitemap_thread.join()
+
+        # A stop cannot start optional post-processing or paid PageSpeed work.
+        if not self._demo_limit_reached and not self._stop_requested:
             # Run PageSpeed analysis if enabled
             if self.config.get('enable_pagespeed', False):
                 print("Running PageSpeed analysis...")
@@ -993,15 +1116,20 @@ class WebCrawler:
 
         # Save final data and set appropriate status
         if self.db_save_enabled and self.crawl_id:
-            self._save_batch_to_db(force=True)
+            saved = self._save_batch_to_db(force=True)
             from src.crawl_db import set_crawl_status
-            if self._demo_limit_reached:
+            if not saved:
+                set_crawl_status(self.crawl_id, 'failed')
+            elif self._demo_limit_reached:
                 set_crawl_status(self.crawl_id, 'demo_stopped')
+            elif self._stop_requested:
+                set_crawl_status(self.crawl_id, 'stopped')
             else:
                 set_crawl_status(self.crawl_id, 'completed')
 
         # Mark crawl as complete
         self.is_running = False
+        self._stop_event.set()
         if self._demo_limit_reached:
             print(f"Crawl stopped (demo limit). User memory: {self.user_memory.total_mb:.0f}MB. Crawled: {self.stats['crawled']}")
         else:
@@ -1021,35 +1149,21 @@ class WebCrawler:
         retries = self.config.get('retries', 3)
         start_time = time.time()
 
+        response = None
         try:
-            # Check file size if configured
-            if self.config.get('max_file_size', 0) > 0:
-                try:
-                    head_response = self.session.head(
-                        url,
-                        timeout=self.config['timeout'],
-                        allow_redirects=self.config['follow_redirects']
-                    )
-                    content_length = head_response.headers.get('content-length')
-                    if content_length and int(content_length) > self.config['max_file_size']:
-                        return self.seo_extractor.create_empty_result(
-                            url, depth, 0,
-                            f'File too large: {content_length} bytes',
-                            error_type='file_too_large'
-                        )
-                except:
-                    pass  # Continue if HEAD request fails
-
-            # Fetch the page with retries
-            response = None
+            # Stream each GET, including redirects, inside the existing retry
+            # boundary. Oversize captures are terminal, not transient failures.
             for attempt in range(retries + 1):
                 try:
                     response = self.session.get(
                         url,
                         timeout=self.config['timeout'],
-                        allow_redirects=self.config['follow_redirects']
+                        allow_redirects=self.config['follow_redirects'],
+                        stream=True
                     )
                     break
+                except HTTPBodyTooLarge:
+                    raise
                 except Exception as e:
                     if attempt >= retries:
                         raise e
@@ -1072,6 +1186,13 @@ class WebCrawler:
                 'error_type': None,
                 'content_type': response.headers.get('content-type', '').split(';')[0],
                 'size': len(response.content),
+                'body_base64': base64.b64encode(response.content).decode('ascii'),
+                'body_sha256': hashlib.sha256(response.content).hexdigest(),
+                'body_text': None,
+                'response_headers': dict(response.headers),
+                'final_url': final_url,
+                'fetched_at': datetime.now(timezone.utc).isoformat(),
+                'capture_method': 'http',
                 'is_internal': is_internal,
                 'depth': depth,
                 'title': '',
@@ -1166,17 +1287,34 @@ class WebCrawler:
             result['linked_from'] = self.link_manager.get_source_pages(url)
             result['response_time'] = round((time.time() - start_time) * 1000, 2)
 
-            # NB: the DB batch is appended by the worker when it accepts this
-            # result into crawl_results, not here. A fetch that finishes after
-            # the worker stops (max_urls reached) must not reach the database,
-            # or a loaded crawl would show rows the crawl never counted.
+            # The worker owns result admission and DB batches; reserved requests
+            # drain through that owner even after stop is requested.
             return result
 
+        except HTTPBodyTooLarge as e:
+            fetched = e.response
+            result = self.seo_extractor.create_empty_result(
+                url, depth, fetched.status_code, str(e), error_type='file_too_large')
+            result.update({
+                'content_type': fetched.headers.get('content-type', '').split(';')[0],
+                'size': e.observed_size,
+                'is_internal': self.link_manager.is_internal(url),
+                'body_base64': None, 'body_sha256': None, 'body_text': None,
+                'response_headers': dict(fetched.headers),
+                'final_url': str(fetched.url or url),
+                'fetched_at': datetime.now(timezone.utc).isoformat(),
+                'capture_method': 'http',
+                'response_time': round((time.time() - start_time) * 1000, 2)
+            })
+            return result
         except Exception as e:
             return self.seo_extractor.create_empty_result(
                 url, depth, 0, str(e),
                 error_type=classify_fetch_error(e)
             )
+        finally:
+            if response is not None:
+                response.close()
 
     async def _crawl_url_with_javascript(self, url, depth):
         """Crawl a single URL using JavaScript rendering"""
@@ -1419,9 +1557,11 @@ class WebCrawler:
 
             # Save final data and set appropriate status
             if self.db_save_enabled and self.crawl_id:
-                self._save_batch_to_db(force=True)
+                saved = self._save_batch_to_db(force=True)
                 from src.crawl_db import set_crawl_status
-                if self._demo_limit_reached:
+                if not saved:
+                    set_crawl_status(self.crawl_id, 'failed')
+                elif self._demo_limit_reached:
                     set_crawl_status(self.crawl_id, 'demo_stopped')
                 else:
                     set_crawl_status(self.crawl_id, 'completed')
@@ -1650,10 +1790,13 @@ class WebCrawler:
                     else:
                         rp.parse(response.text.splitlines())
                     self._robots_cache[robots_url] = rp
-                except:
-                    return True
+                except Exception as e:
+                    self._record_acquisition_error(robots_url, e)
+                    self._robots_cache[robots_url] = None
 
             rp = self._robots_cache[robots_url]
+            if rp is None:
+                return True  # Existing permissive policy, with an explicit gap.
             user_agent = self.config.get('user_agent', '*')
             return rp.can_fetch(user_agent, url)
 

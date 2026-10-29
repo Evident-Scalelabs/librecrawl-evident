@@ -30,6 +30,7 @@ class SEOExtractor:
 
         # Count words
         text_content = soup.get_text()
+        result['body_text'] = soup.get_text(separator=' ', strip=True)
         words = re.findall(r'\b\w+\b', text_content)
         result['word_count'] = len(words)
 
@@ -262,8 +263,8 @@ class SEOExtractor:
     def create_empty_result(url, depth, status_code=0, error=None, error_type=None):
         """Create an empty result structure.
 
-        error_type: optional classification when status_code is 0 (no HTTP
-        response). Values: 'dns_not_found', 'connection_refused', 'timeout',
+        error_type: optional failed/incomplete capture classification, including
+        when status_code is 0 (no HTTP response). Values: 'dns_not_found', 'connection_refused', 'timeout',
         'ssl_error', 'connection_error', 'file_too_large', or None.
         """
         return {
