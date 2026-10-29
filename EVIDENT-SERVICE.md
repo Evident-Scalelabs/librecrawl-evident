@@ -20,10 +20,16 @@ Waitress listens on both IPv4 and IPv6 for health checks and private networking;
 all `/api/*` requests require `Authorization: Bearer <service key>`. UI and
 login routes return 404. There is no external identity provider or customer login.
 Health also exposes the fixed, non-secret request policy. The HTTP identity is
-`LibreCrawl/1.0 (Web Crawler)`. Settings, start and both resume paths refuse a
+`EvidentBot/1.0 (+https://evident.so/bot)`. Robots group selection uses the same
+identity sent by the shared HTTP session (pages, robots, redirects and sitemaps).
+Settings, start and both resume paths refuse a
 different identity, robots opt-out, custom headers or proxies. Ambient proxy and
 netrc settings are disabled too. A saved crawl with incompatible policy must not
-be resumed; create a new bounded request instead.
+be resumed; create a new bounded request instead. Existing saved settings with
+the old LibreCrawl identity must explicitly set `userAgent` to the identity above
+before starting new work; historical crawl snapshots are not rewritten. The
+contact URL was reported as HTTP 404 on 2026-10-29; this change does not claim
+the contact page is live. Non-private upstream defaults retain LibreCrawl identity.
 
 Send `enableLinkChecks: false` in saved acquisition settings. It maps to
 `enable_link_checks` and defaults to false in this private service. Opt-in is
@@ -69,7 +75,8 @@ tenant/scan authority and records the returned `crawl_id` under its owning job.
 
 1. `POST /api/save_settings` with explicit acquisition limits, for example
    `{"maxDepth":2,"maxUrls":100,"crawlDelay":1,"concurrency":2,"maxFileSize":2,
-   "enableJavaScript":false,"enablePageSpeed":false,"enableDuplicationCheck":false,"enableLinkChecks":false}`.
+   "enableJavaScript":false,"enablePageSpeed":false,"enableDuplicationCheck":false,"enableLinkChecks":false,
+   "userAgent":"EvidentBot/1.0 (+https://evident.so/bot)"}`.
    Size is in MiB. Start/resume/settings-update admission requires finite positive
    limits: at most 1,000 pages, depth 10 and 10 MiB per decoded body. It rejects
    the upstream five-million-URL/50-MiB UI defaults; save bounded settings first.
@@ -128,7 +135,7 @@ fails. Cleanup only removes successfully drained and saved instances.
 `python tests/evidence_tests.py` checks exact bytes/text/headers/final URL through
 SQLite and JSON exports, retry-safe persistence, shared GET/HEAD/redirect pacing,
 decoded-body limits, stream failure/response closure, and private bounded
-HTTP-only API admission. The fifteen cases include ancillary-dispatch admission, robots provenance/migration round-trips, compressed ancillary limits,
+HTTP-only API admission. The sixteen cases include EvidentBot-specific robots refusal, ancillary-dispatch admission, robots provenance/migration round-trips, compressed ancillary limits,
 active-page reservations, stop/drain and failed-save cleanup/shutdown.
 Policy fixtures also refuse spoofed settings/saved resumes and prove denied
 HEAD/redirect/sitemap requests and unknown robots never dispatch the page body.
