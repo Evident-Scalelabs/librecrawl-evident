@@ -3,6 +3,7 @@ Main web crawler orchestrator with smooth rate limiting and modular architecture
 Refactored for better code practices and maintainability.
 """
 import requests
+import os
 import base64
 import hashlib
 from datetime import datetime, timezone
@@ -23,6 +24,13 @@ IMAGE_EXTENSIONS = {'jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'ico', 'avif', '
 
 # Parallel HEAD checks for images and (uncrawled) external links
 HEAD_CHECK_WORKERS = 5
+HTTP_USER_AGENT = 'LibreCrawl/1.0 (Web Crawler)'
+
+
+class RobotsAccessDenied(Exception):
+    def __init__(self, url, unavailable):
+        self.error_type = 'robots_unavailable' if unavailable else 'robots_disallowed'
+        super().__init__(f'{self.error_type}: robots.txt does not permit acquisition of {url}')
 
 
 class HTTPBodyTooLarge(Exception):
@@ -103,8 +111,12 @@ class WebCrawler:
     def __init__(self, crawl_id=None, resume_from_db=False):
         # HTTP session
         self.session = requests.Session()
+        self.private_http_service = os.environ.get('LIBRECRAWL_PRIVATE_SERVICE') == 'true'
+        if self.private_http_service:
+            self.session.trust_env = False  # No ambient proxy or netrc identity.
+        self._robots_fetch_state = threading.local()
         self.session.headers.update({
-            'User-Agent': 'LibreCrawl/1.0 (Web Crawler)'
+            'User-Agent': HTTP_USER_AGENT
         })
         self._set_pool_size(self._get_default_config()['concurrency'])
 
@@ -209,9 +221,21 @@ class WebCrawler:
 
         class PacedHTTPAdapter(requests.adapters.HTTPAdapter):
             def send(self, request, **kwargs):
+                if crawler._stop_event.is_set():
+                    raise requests.RequestException('Crawl stopped before HTTP dispatch')
+                if (crawler.private_http_service and
+                        not getattr(crawler._robots_fetch_state, 'active', False) and
+                        urlparse(request.url).path != '/robots.txt' and
+                        not crawler._check_robots_txt(request.url)):
+                    parsed = urlparse(request.url)
+                    unavailable = crawler._robots_cache.get(f'{parsed.scheme}://{parsed.netloc}/robots.txt') is None
+                    raise RobotsAccessDenied(request.url, unavailable)
                 # Pace pages, redirects, robots/sitemaps and HEAD checks together.
                 if crawler.config.get('delay', 0) > 0 and crawler.rate_limiter:
                     crawler.rate_limiter.acquire()
+                # A stop may arrive while this request waits for its turn.
+                if crawler._stop_event.is_set():
+                    raise requests.RequestException('Crawl stopped before HTTP dispatch')
                 return super().send(request, **kwargs)
 
         adapter = PacedHTTPAdapter(
@@ -267,7 +291,7 @@ class WebCrawler:
             'delay': 1.0,
             'follow_redirects': True,
             'crawl_external': False,
-            'user_agent': 'LibreCrawl/1.0 (Web Crawler)',
+            'user_agent': HTTP_USER_AGENT,
             'timeout': 10,
             'retries': 3,
             'accept_language': 'en-US,en;q=0.9',
@@ -486,6 +510,7 @@ class WebCrawler:
         self.persistence_error = None
         self._sitemap_discovery_done = True
         self._ancillary_error_keys.clear()
+        self._robots_cache.clear()
         self._stop_requested = False
         self._stop_event.clear()
         self._active_fetches = 0
@@ -1162,7 +1187,7 @@ class WebCrawler:
                         stream=True
                     )
                     break
-                except HTTPBodyTooLarge:
+                except (HTTPBodyTooLarge, RobotsAccessDenied):
                     raise
                 except Exception as e:
                     if attempt >= retries:
@@ -1310,7 +1335,7 @@ class WebCrawler:
         except Exception as e:
             return self.seo_extractor.create_empty_result(
                 url, depth, 0, str(e),
-                error_type=classify_fetch_error(e)
+                error_type=e.error_type if isinstance(e, RobotsAccessDenied) else classify_fetch_error(e)
             )
         finally:
             if response is not None:
@@ -1782,9 +1807,16 @@ class WebCrawler:
                     # instead of rp.read() which uses urllib with Python's
                     # default UA — many servers return 403 for that, causing
                     # RobotFileParser to set disallow_all=True and block everything.
-                    response = self.session.get(robots_url, timeout=10)
+                    self._robots_fetch_state.active = True
+                    try:
+                        response = self.session.get(robots_url, timeout=10)
+                    finally:
+                        self._robots_fetch_state.active = False
                     if response.status_code in (401, 403):
                         rp.disallow_all = True
+                    elif (self.private_http_service and response.status_code >= 400
+                          and response.status_code not in (404, 410)):
+                        raise requests.HTTPError(f'robots.txt unavailable: HTTP {response.status_code}')
                     elif response.status_code >= 400:
                         rp.allow_all = True
                     else:
@@ -1795,13 +1827,16 @@ class WebCrawler:
                     self._robots_cache[robots_url] = None
 
             rp = self._robots_cache[robots_url]
-            if rp is None:
-                return True  # Existing permissive policy, with an explicit gap.
             user_agent = self.config.get('user_agent', '*')
-            return rp.can_fetch(user_agent, url)
+            allowed = not self.private_http_service if rp is None else rp.can_fetch(user_agent, url)
+            if not allowed and self.private_http_service:
+                self._record_acquisition_error(url, RobotsAccessDenied(url, rp is None))
+            return allowed
 
-        except Exception:
-            return True
+        except Exception as e:
+            if self.private_http_service:
+                self._record_acquisition_error(url, e)
+            return not self.private_http_service
 
     def _run_pagespeed_analysis(self):
         """Run PageSpeed analysis on selected pages"""

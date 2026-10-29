@@ -25,7 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import requests
 from urllib3.response import HTTPResponse
 from src import auth_db, crawl_db
-from src.crawler import WebCrawler
+from src.crawler import HTTP_USER_AGENT, RobotsAccessDenied, WebCrawler
 from src.core.rate_limiter import RateLimiter
 
 
@@ -55,8 +55,9 @@ class EvidenceFixtures(unittest.TestCase):
             item.stop()
         self.directory.cleanup()
 
-    def make_crawl(self):
-        crawler = WebCrawler()
+    def make_crawl(self, private_service=False):
+        with patch.dict(os.environ, {'LIBRECRAWL_PRIVATE_SERVICE': str(private_service).lower()}):
+            crawler = WebCrawler()
         crawler.base_url = 'https://example.test'
         crawler.base_domain = 'example.test'
         crawler.config.update({'delay': 0, 'max_file_size': 0,
@@ -344,6 +345,98 @@ class EvidenceFixtures(unittest.TestCase):
         self.assertEqual([entry[0] for entry in calls], ['GET', 'GET', 'HEAD'])
         self.assertTrue(all(b[2] - a[2] >= 0.035 for a, b in zip(calls, calls[1:])), calls)
 
+    def test_stopped_crawl_does_not_dispatch_queued_http(self):
+        crawler = WebCrawler()
+        crawler.config['delay'] = 1
+        crawler.rate_limiter = RateLimiter(1)
+        with patch.object(requests.adapters.HTTPAdapter, 'send') as send, \
+                patch.object(crawler.rate_limiter, 'acquire') as acquire:
+            crawler._stop_event.set()
+            for method in ('GET', 'HEAD'):
+                with self.subTest(method=method), self.assertRaisesRegex(requests.RequestException, 'Crawl stopped'):
+                    crawler.session.request(method, 'https://example.test/queued')
+            acquire.assert_not_called()
+            crawler._stop_event.clear()
+            acquire.side_effect = crawler._stop_event.set
+            with self.assertRaisesRegex(requests.RequestException, 'Crawl stopped'):
+                crawler.session.get('https://example.test/waiting')
+            send.assert_not_called()
+
+    def test_private_http_policy_covers_head_redirects_sitemaps_and_unknown_robots(self):
+        crawler = self.make_crawl(private_service=True)
+        crawler.config['respect_robots'] = True
+        calls = []
+
+        def respond(adapter, request, **kwargs):
+            calls.append((request.method, request.url, request.headers['User-Agent'], kwargs.get('proxies')))
+            response = requests.Response()
+            response.headers['Content-Type'] = 'text/html; charset=utf-8'
+            response.url = request.url
+            response.request = request
+            response.status_code = 200
+            body = b'<html><title>Allowed</title><a href="/private/discovered">Private</a></html>'
+            if request.url.endswith('/robots.txt'):
+                if 'policy-redirect.test' in request.url:
+                    response.status_code = 302
+                    response.headers['Location'] = '/policy'
+                    body = b''
+                elif 'unavailable.test' in request.url:
+                    response.status_code = 503
+                    body = b'unavailable'
+                elif 'missing.test' in request.url:
+                    response.status_code = 404
+                    body = b''
+                elif 'forbidden.test' in request.url:
+                    response.status_code = 403
+                    body = b'Forbidden'
+                else:
+                    body = b'User-agent: *\nDisallow: /private\nDisallow: /sitemap.xml\n'
+            elif request.url == 'https://policy-redirect.test/policy':
+                body = b'User-agent: *\nDisallow: /private\n'
+            elif request.url.endswith('/redirect'):
+                response.status_code = 302
+                response.headers['Location'] = '/private'
+                body = b''
+            response.raw = HTTPResponse(body=io.BytesIO(body), preload_content=False)
+            return response
+
+        with patch.dict(os.environ, {'HTTPS_PROXY': 'http://ambient.invalid:8080'}), \
+                patch.object(requests.adapters.HTTPAdapter, 'send', new=respond):
+            self.assertFalse(crawler.session.trust_env)
+            for method in ('GET', 'HEAD'):
+                with self.subTest(method=method), self.assertRaises(RobotsAccessDenied):
+                    crawler.session.request(method, crawler.base_url + '/private')
+            redirected = crawler._crawl_url_with_requests(crawler.base_url + '/redirect', 0)
+            self.assertEqual(redirected['error_type'], 'robots_disallowed')
+            self.assertEqual(crawler.sitemap_parser._parse_sitemap(crawler.base_url + '/sitemap.xml'), [])
+            unavailable = crawler._crawl_url_with_requests('https://unavailable.test/page', 0)
+            self.assertEqual(unavailable['error_type'], 'robots_unavailable')
+            forbidden = crawler._crawl_url_with_requests('https://forbidden.test/page', 0)
+            self.assertEqual(forbidden['error_type'], 'robots_disallowed')
+            self.assertEqual(crawler.session.get('https://missing.test/page').status_code, 200)
+            allowed = crawler._crawl_url_with_requests(crawler.base_url + '/public', 0)
+            self.assertEqual(allowed['status_code'], 200)
+            self.assertEqual(crawler.session.get('https://policy-redirect.test/page').status_code, 200)
+            with self.assertRaises(RobotsAccessDenied):
+                crawler.session.get('https://policy-redirect.test/private')
+        dispatched = [url for _, url, _, _ in calls]
+        self.assertNotIn(crawler.base_url + '/private', dispatched)
+        self.assertNotIn(crawler.base_url + '/sitemap.xml', dispatched)
+        self.assertNotIn('https://unavailable.test/page', dispatched)
+        self.assertNotIn('https://forbidden.test/page', dispatched)
+        self.assertNotIn(crawler.base_url + '/private/discovered', dispatched)
+        self.assertNotIn('https://policy-redirect.test/private', dispatched)
+        self.assertEqual(dispatched.count('https://policy-redirect.test/robots.txt'), 1)
+        self.assertIn('https://policy-redirect.test/policy', dispatched)
+        self.assertEqual(dispatched.count('https://unavailable.test/robots.txt'), 1)
+        self.assertTrue(all(agent == HTTP_USER_AGENT and not proxies for _, _, agent, proxies in calls))
+        self.assertTrue(crawler._save_batch_to_db(force=True))
+        issues = crawl_db.load_crawl_issues(crawler.crawl_id)
+        discovered_gaps = [issue for issue in issues if issue['url'] == crawler.base_url + '/private/discovered'
+                           and issue['category'] == 'Acquisition']
+        self.assertEqual(len(discovered_gaps), 1)
+        self.assertIn('robots_disallowed', discovered_gaps[0]['details'])
+
     def test_private_entrypoint_requires_service_key_and_refuses_browser_work(self):
         with patch.dict(os.environ, {'LIBRECRAWL_API_KEY': 'fixture-service-key'}):
             service = importlib.import_module('service')
@@ -355,6 +448,12 @@ class EvidenceFixtures(unittest.TestCase):
             headers = {'Authorization': 'Bearer fixture-service-key'}
             self.assertEqual(client.get('/', headers=headers).status_code, 404)
             self.assertEqual(client.get('/api/get_settings', headers=headers).status_code, 200)
+            self.assertEqual(client.get('/healthz').get_json()['requestPolicy']['userAgent'], HTTP_USER_AGENT)
+            for settings in ({'userAgent': 'Mozilla/5.0'}, {'respectRobotsTxt': False},
+                             {'enableProxy': True}, {'proxyUrl': 'http://proxy.invalid'},
+                             {'customHeaders': 'User-Agent: Mozilla/5.0'}):
+                with self.subTest(settings=settings):
+                    self.assertEqual(client.post('/api/save_settings', headers=headers, json=settings).status_code, 400)
             # Upstream defaults are not an admitted acquisition budget.
             with patch.object(WebCrawler, 'start_crawl') as start:
                 rejected = client.post('/api/start_crawl', headers=headers,
@@ -375,6 +474,14 @@ class EvidenceFixtures(unittest.TestCase):
             rejected = client.post(f'/api/crawls/{invalid_saved}/resume', headers=headers)
             self.assertEqual(rejected.status_code, 400)
             self.assertIn('max_file_size', rejected.get_json()['error'])
+            bounded = WebCrawler()._get_default_config()
+            bounded['max_file_size'] = 1024 * 1024
+            for overrides in ({'user_agent': 'Mozilla/5.0'}, {'respect_robots': False},
+                              {'enable_proxy': True}, {'custom_headers': {'User-Agent': 'Spoofed'}}):
+                saved = crawl_db.create_crawl(None, 'old', 'https://example.test',
+                                              'example.test', {**bounded, **overrides})
+                with self.subTest(saved=overrides):
+                    self.assertEqual(client.post(f'/api/crawls/{saved}/resume', headers=headers).status_code, 400)
             for value in (0, float('nan'), float('inf'), 11 * 1024 * 1024):
                 self.assertIsNotNone(service.capture_limit_error(
                     {'max_urls': 100, 'max_depth': 2, 'max_file_size': value}))

@@ -19,6 +19,20 @@ health includes `producerRevision` from Railway’s source commit identity (null
 Waitress listens on both IPv4 and IPv6 for health checks and private networking;
 all `/api/*` requests require `Authorization: Bearer <service key>`. UI and
 login routes return 404. There is no external identity provider or customer login.
+Health also exposes the fixed, non-secret request policy. The HTTP identity is
+`LibreCrawl/1.0 (Web Crawler)`. Settings, start and both resume paths refuse a
+different identity, robots opt-out, custom headers or proxies. Ambient proxy and
+netrc settings are disabled too. A saved crawl with incompatible policy must not
+be resumed; create a new bounded request instead.
+
+Robots permission is checked by the shared HTTP transport before page, HEAD,
+sitemap and redirect-target dispatch. Fetching robots itself (and its redirect
+chain) is exempt from recursive robots checks. HTTP 404/410 permits acquisition;
+401/403 denies it. Other HTTP failures, oversized robots and network failures
+fail closed with explicit acquisition gaps. `robots_disallowed` and
+`robots_unavailable` rows have no page body; neither is a customer Finding or a
+complete page capture. No identity rotation, browser impersonation or challenge
+evasion is provided by this entrypoint.
 
 The service starts idle. It does not crawl, render, query providers or invoke a
 model on startup. Supply no PageSpeed or other provider key.
@@ -77,7 +91,8 @@ are required. Resume checkpoints retain upstream's 1,000-pending-URL limit;
 this first slice does not promise complete frontier recovery for larger crawls.
 
 The page cap includes active request reservations. Stop/pause stops new dispatch
-and drains already dispatched results through the same retention owner. A stop
+and drains already dispatched results through the same retention owner. Queued
+GET/HEAD/redirect requests check stop again after pacing, before HTTP dispatch. A stop
 may return `success: false` while status is `stopping`; the instance cannot be
 reused or evicted during drain or after a failed save. SIGTERM closes acquisition
 admission, requests stop for every owner, waits for acquired work, and flushes
@@ -89,8 +104,10 @@ fails. Cleanup only removes successfully drained and saved instances.
 `python tests/evidence_tests.py` checks exact bytes/text/headers/final URL through
 SQLite and JSON exports, retry-safe persistence, shared GET/HEAD/redirect pacing,
 decoded-body limits, stream failure/response closure, and private bounded
-HTTP-only API admission. The ten cases include compressed ancillary limits,
+HTTP-only API admission. The twelve cases include compressed ancillary limits,
 active-page reservations, stop/drain and failed-save cleanup/shutdown.
+Policy fixtures also refuse spoofed settings/saved resumes and prove denied
+HEAD/redirect/sitemap requests and unknown robots never dispatch the page body.
 `SKIP_BROWSER_TESTS=1 python
 tests/fixture_tests.py` exercises the existing local HTTP fixtures with its
 browser case explicitly skipped. These commands use no browser or paid service.
