@@ -300,6 +300,7 @@ class WebCrawler:
             'delay': 1.0,
             'follow_redirects': True,
             'crawl_external': False,
+            'enable_link_checks': not self.private_http_service,
             'user_agent': HTTP_USER_AGENT,
             'timeout': 10,
             'retries': 3,
@@ -1675,6 +1676,10 @@ class WebCrawler:
         rows for links to sites that were not crawled, which the Overview
         leaves out.
         """
+        # Private page budgets do not admit unbudgeted ancillary requests.
+        if self.private_http_service or not self.config.get('enable_link_checks', True):
+            return
+
         # Statuses set here are journalled at the end: these links were already
         # announced by the link manager, so the UI only learns about a HEAD
         # result if we emit an update for it

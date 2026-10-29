@@ -25,6 +25,17 @@ different identity, robots opt-out, custom headers or proxies. Ambient proxy and
 netrc settings are disabled too. A saved crawl with incompatible policy must not
 be resumed; create a new bounded request instead.
 
+Send `enableLinkChecks: false` in saved acquisition settings. It maps to
+`enable_link_checks` and defaults to false in this private service. Opt-in is
+refused on settings/start/update/resume: ancillary image/external-link HEAD
+checks (including GET fallback and their robots requests) have no admitted
+request budget. The dispatch owner also disables these checks for the private
+profile. Parsed links and image metadata remain available with unknown target
+statuses; no synthetic checked-link rows are produced. Main page acquisition,
+its robots checks and the page queue retain their existing behavior. Health
+reports `requestPolicy.linkChecks: disabled`. Upstream non-private operation
+keeps link checks enabled by default and can explicitly turn this setting off.
+
 Robots permission is checked by the shared HTTP transport before page, HEAD,
 sitemap and redirect-target dispatch. Fetching robots itself (and its redirect
 chain) is exempt from recursive robots checks. HTTP 404/410 permits acquisition;
@@ -58,7 +69,7 @@ tenant/scan authority and records the returned `crawl_id` under its owning job.
 
 1. `POST /api/save_settings` with explicit acquisition limits, for example
    `{"maxDepth":2,"maxUrls":100,"crawlDelay":1,"concurrency":2,"maxFileSize":2,
-   "enableJavaScript":false,"enablePageSpeed":false,"enableDuplicationCheck":false}`.
+   "enableJavaScript":false,"enablePageSpeed":false,"enableDuplicationCheck":false,"enableLinkChecks":false}`.
    Size is in MiB. Start/resume/settings-update admission requires finite positive
    limits: at most 1,000 pages, depth 10 and 10 MiB per decoded body. It rejects
    the upstream five-million-URL/50-MiB UI defaults; save bounded settings first.
@@ -117,7 +128,7 @@ fails. Cleanup only removes successfully drained and saved instances.
 `python tests/evidence_tests.py` checks exact bytes/text/headers/final URL through
 SQLite and JSON exports, retry-safe persistence, shared GET/HEAD/redirect pacing,
 decoded-body limits, stream failure/response closure, and private bounded
-HTTP-only API admission. The thirteen cases include robots provenance/migration round-trips, compressed ancillary limits,
+HTTP-only API admission. The fifteen cases include ancillary-dispatch admission, robots provenance/migration round-trips, compressed ancillary limits,
 active-page reservations, stop/drain and failed-save cleanup/shutdown.
 Policy fixtures also refuse spoofed settings/saved resumes and prove denied
 HEAD/redirect/sitemap requests and unknown robots never dispatch the page body.

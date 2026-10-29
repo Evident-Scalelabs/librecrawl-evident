@@ -39,7 +39,7 @@ class SettingsManager:
         extra_settings = user_settings + [
             # Requests tab
             'userAgent', 'timeout', 'retries', 'acceptLanguage', 'respectRobotsTxt', 'allowCookies',
-            'discoverSitemaps', 'enablePageSpeed', 'googleApiKey',
+            'discoverSitemaps', 'enablePageSpeed', 'googleApiKey', 'enableLinkChecks',
             # Filters tab
             'includeExtensions', 'excludeExtensions', 'includePatterns', 'excludePatterns', 'maxFileSize',
             'crawlImages',
@@ -79,6 +79,7 @@ class SettingsManager:
             'crawlDelay': 1,
             'followRedirects': True,
             'crawlExternalLinks': False,
+            'enableLinkChecks': os.environ.get('LIBRECRAWL_PRIVATE_SERVICE') != 'true',
 
             # Request settings
             'userAgent': 'LibreCrawl/1.0 (Web Crawler)',
@@ -423,6 +424,9 @@ class SettingsManager:
                 if key not in settings:
                     return False
 
+            if not isinstance(settings['enableLinkChecks'], bool):
+                return False
+
             # Validate numeric ranges
             numeric_validations = {
                 'maxDepth': (1, 10),
@@ -482,6 +486,7 @@ class SettingsManager:
             'delay': settings['crawlDelay'],
             'follow_redirects': settings['followRedirects'],
             'crawl_external': settings['crawlExternalLinks'],
+            'enable_link_checks': settings.get('enableLinkChecks', self.default_settings['enableLinkChecks']),
             'user_agent': settings['userAgent'],
             'timeout': settings['timeout'],
             'retries': settings['retries'],
