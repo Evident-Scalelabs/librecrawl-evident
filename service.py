@@ -12,12 +12,25 @@ if not API_KEY or not os.environ.get('SECRET_KEY'):
 os.environ['LOCAL_MODE'] = 'true'
 os.environ['REGISTRATION_DISABLED'] = 'true'
 os.environ['DISABLE_GUEST'] = 'true'
+os.environ['LIBRECRAWL_PRIVATE_SERVICE'] = 'true'
 
 import main
 from flask import jsonify, request, session
 from src.crawl_db import get_crawl_by_id, get_db
+from src.crawler import HTTP_USER_AGENT
 
 app = main.app
+
+
+def capture_policy_error(config):
+    if config.get('user_agent') != HTTP_USER_AGENT:
+        return f'This service requires the honest crawler identity: {HTTP_USER_AGENT}'
+    if config.get('respect_robots') is not True:
+        return 'This service requires robots.txt permission'
+    if (config.get('enable_proxy') is not False or config.get('proxy_url')
+            or config.get('custom_headers')):
+        return 'This service refuses proxies and custom request headers'
+    return None
 
 
 def capture_limit_error(config):
@@ -46,6 +59,11 @@ def require_service_key():
         settings = request.get_json(silent=True) or {}
         if settings.get('enableJavaScript') not in (None, False) or settings.get('enablePageSpeed') not in (None, False):
             return jsonify({'error': 'This service only collects HTTP evidence'}), 400
+        policy = {'userAgent': HTTP_USER_AGENT, 'respectRobotsTxt': True,
+                  'enableProxy': False, 'proxyUrl': '', 'customHeaders': ''}
+        for key, expected in policy.items():
+            if key in settings and (type(settings[key]) is not type(expected) or settings[key] != expected):
+                return jsonify({'error': f'This service requires {key}={expected!r}'}), 400
     if request.path in ('/api/start_crawl', '/api/resume_crawl', '/api/update_crawler_settings') or request.path.endswith('/resume'):
         if request.endpoint == 'resume_crawl_endpoint':
             crawl = get_crawl_by_id(request.view_args['crawl_id'])
@@ -61,6 +79,9 @@ def require_service_key():
         error = capture_limit_error(config)
         if error:
             return jsonify({'error': error}), 400
+        error = capture_policy_error(config)
+        if error:
+            return jsonify({'error': error}), 400
 
 
 @app.route('/healthz')
@@ -68,7 +89,10 @@ def health():
     with get_db() as connection:
         connection.execute('SELECT 1')
     return jsonify({'status': 'ok', 'capture_method': 'http',
-                    'producerRevision': os.environ.get('RAILWAY_GIT_COMMIT_SHA')})
+                    'producerRevision': os.environ.get('RAILWAY_GIT_COMMIT_SHA'),
+                    'requestPolicy': {'userAgent': HTTP_USER_AGENT,
+                                      'robots': 'required_fail_closed',
+                                      'proxy': 'disabled', 'customHeaders': 'disabled'}})
 
 
 if __name__ == '__main__':
