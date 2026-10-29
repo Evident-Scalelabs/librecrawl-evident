@@ -25,6 +25,8 @@ app = main.app
 def capture_policy_error(config):
     if config.get('user_agent') != HTTP_USER_AGENT:
         return f'This service requires the honest crawler identity: {HTTP_USER_AGENT}'
+    if config.get('enable_link_checks', False) is not False:
+        return 'Ancillary link checks are unsupported by this bounded HTTP service'
     if config.get('respect_robots') is not True:
         return 'This service requires robots.txt permission'
     if (config.get('enable_proxy') is not False or config.get('proxy_url')
@@ -59,6 +61,8 @@ def require_service_key():
         settings = request.get_json(silent=True) or {}
         if settings.get('enableJavaScript') not in (None, False) or settings.get('enablePageSpeed') not in (None, False):
             return jsonify({'error': 'This service only collects HTTP evidence'}), 400
+        if 'enableLinkChecks' in settings and settings['enableLinkChecks'] is not False:
+            return jsonify({'error': 'Ancillary link checks are unsupported by this bounded HTTP service'}), 400
         policy = {'userAgent': HTTP_USER_AGENT, 'respectRobotsTxt': True,
                   'enableProxy': False, 'proxyUrl': '', 'customHeaders': ''}
         for key, expected in policy.items():
@@ -92,6 +96,7 @@ def health():
                     'producerRevision': os.environ.get('RAILWAY_GIT_COMMIT_SHA'),
                     'requestPolicy': {'userAgent': HTTP_USER_AGENT,
                                       'robots': 'required_fail_closed',
+                                      'linkChecks': 'disabled',
                                       'proxy': 'disabled', 'customHeaders': 'disabled'}})
 
 

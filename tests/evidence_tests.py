@@ -529,8 +529,94 @@ class EvidenceFixtures(unittest.TestCase):
                     crawl_db.load_crawl_issues(crawler.crawl_id)[0]):
             self.assertTrue(all(row[field] is None for field in fields))
 
+    def test_private_api_disables_ancillary_dispatch_but_retains_parsed_evidence(self):
+        calls = []
+        page = (b'<html><title>Bounded page</title><a href="https://external.test/offer">Offer</a>'
+                b'<img src="https://cdn.test/logo.png" alt="Logo"><img src="/local.png"></html>')
+
+        def respond(adapter, request, **kwargs):
+            calls.append((request.method, request.url))
+            self.assertEqual(request.method, 'GET')
+            self.assertIn(request.url, ('https://example.test/robots.txt', 'https://example.test/page'))
+            response = requests.Response()
+            response.url = request.url
+            response.request = request
+            response.status_code = 200
+            response.headers['Content-Type'] = 'text/html; charset=utf-8'
+            body = b'User-agent: *\nAllow: /\n' if request.url.endswith('/robots.txt') else page
+            response.raw = HTTPResponse(body=io.BytesIO(body), preload_content=False)
+            return response
+
+        with patch.dict(os.environ, {'LIBRECRAWL_PRIVATE_SERVICE': 'true'}), \
+                patch.object(requests.adapters.HTTPAdapter, 'send', new=respond), \
+                self.web.app.test_client() as client:
+            headers = {'Authorization': 'Bearer fixture-service-key'}
+            settings = {'maxDepth': 1, 'maxUrls': 1, 'maxFileSize': 1, 'crawlDelay': 0,
+                        'concurrency': 1, 'discoverSitemaps': False, 'enableDuplicationCheck': False,
+                        'enableLinkChecks': False, 'crawlExternalLinks': False, 'crawlImages': False}
+            saved = client.post('/api/save_settings', headers=headers, json=settings)
+            self.assertTrue(saved.get_json()['success'])
+            self.assertFalse(self.web.get_session_settings().get_crawler_config()['enable_link_checks'])
+            self.assertEqual(client.get('/healthz').get_json()['requestPolicy']['linkChecks'], 'disabled')
+            started = client.post('/api/start_crawl', headers=headers, json={'url': 'https://example.test/page'})
+            self.assertTrue(started.get_json()['success'])
+            crawler = self.web.get_or_create_crawler()
+            crawler.crawl_thread.join(timeout=3)
+            crawler.auto_save_thread.join(timeout=1)
+            self.assertFalse(crawler._has_live_threads())
+            payload = client.get(f"/api/crawls/{started.get_json()['crawl_id']}", headers=headers).get_json()
+            self.assertEqual(calls, [('GET', 'https://example.test/robots.txt'),
+                                     ('GET', 'https://example.test/page')])
+            self.assertEqual(len(payload['urls']), 1)
+            row = payload['urls'][0]
+            self.assertEqual(base64.b64decode(row['body_base64']), page)
+            self.assertEqual(len(row['images']), 2)
+            self.assertEqual({link['target_url'] for link in payload['links']},
+                             {'https://external.test/offer', 'https://cdn.test/logo.png',
+                              'https://example.test/local.png'})
+            self.assertTrue(all(link['target_status'] is None for link in payload['links']))
+            # The dispatch owner also refuses an internal opt-in and legacy missing config.
+            for config in ({'enable_link_checks': True}, {}):
+                crawler.config.pop('enable_link_checks', None)
+                crawler.config.update(config)
+                crawler._head_check_links(payload['links'])
+            self.assertEqual(len(calls), 2)
+
+    def test_upstream_link_checks_remain_enabled_by_default_and_can_be_disabled(self):
+        from src.settings_manager import SettingsManager
+        with patch.dict(os.environ, {'LIBRECRAWL_PRIVATE_SERVICE': 'false'}):
+            settings = SettingsManager(tier='admin')
+            self.assertTrue(settings.get_crawler_config()['enable_link_checks'])
+            crawler = self.make_crawl()
+        self.assertTrue(crawler.config['enable_link_checks'])
+        crawler.config.pop('enable_link_checks')  # Historical upstream config remains enabled.
+        calls = []
+
+        def respond(adapter, request, **kwargs):
+            calls.append((request.method, request.url))
+            response = requests.Response()
+            response.url = request.url
+            response.request = request
+            response.status_code = 405 if request.method == 'HEAD' else 200
+            response.headers.update({'Content-Type': 'image/png', 'Content-Length': '0'})
+            response.raw = HTTPResponse(body=io.BytesIO(b''), preload_content=False)
+            return response
+
+        with patch.object(requests.adapters.HTTPAdapter, 'send', new=respond):
+            links = [{'target_url': 'https://cdn.test/logo.png', 'target_status': None}]
+            crawler._head_check_links(links)
+            self.assertEqual(calls, [('HEAD', 'https://cdn.test/logo.png'),
+                                     ('GET', 'https://cdn.test/logo.png')])
+            self.assertEqual(links[0]['target_status'], 200)
+            self.assertTrue(settings.save_settings({'enableLinkChecks': False})[0])
+            crawler.update_config(settings.get_crawler_config())
+            crawler._head_check_links([{'target_url': 'https://other.test/unchecked', 'target_status': None}])
+            self.assertEqual(len(calls), 2)
+        self.assertFalse(settings.save_settings({'enableLinkChecks': 'false'})[0])
+
     def test_private_entrypoint_requires_service_key_and_refuses_browser_work(self):
-        with patch.dict(os.environ, {'LIBRECRAWL_API_KEY': 'fixture-service-key'}):
+        with patch.dict(os.environ, {'LIBRECRAWL_API_KEY': 'fixture-service-key',
+                                     'LIBRECRAWL_PRIVATE_SERVICE': 'true'}):
             service = importlib.import_module('service')
             client = service.app.test_client()
             self.assertEqual(client.get('/healthz').status_code, 200)
@@ -543,7 +629,8 @@ class EvidenceFixtures(unittest.TestCase):
             self.assertEqual(client.get('/healthz').get_json()['requestPolicy']['userAgent'], HTTP_USER_AGENT)
             for settings in ({'userAgent': 'Mozilla/5.0'}, {'respectRobotsTxt': False},
                              {'enableProxy': True}, {'proxyUrl': 'http://proxy.invalid'},
-                             {'customHeaders': 'User-Agent: Mozilla/5.0'}):
+                             {'customHeaders': 'User-Agent: Mozilla/5.0'}, {'enableLinkChecks': True},
+                             {'enableLinkChecks': 'false'}, {'enableLinkChecks': 0}):
                 with self.subTest(settings=settings):
                     self.assertEqual(client.post('/api/save_settings', headers=headers, json=settings).status_code, 400)
             # Upstream defaults are not an admitted acquisition budget.
@@ -569,11 +656,14 @@ class EvidenceFixtures(unittest.TestCase):
             bounded = WebCrawler()._get_default_config()
             bounded['max_file_size'] = 1024 * 1024
             for overrides in ({'user_agent': 'Mozilla/5.0'}, {'respect_robots': False},
-                              {'enable_proxy': True}, {'custom_headers': {'User-Agent': 'Spoofed'}}):
+                              {'enable_proxy': True}, {'custom_headers': {'User-Agent': 'Spoofed'}},
+                              {'enable_link_checks': True}, {'enable_link_checks': 'false'}):
                 saved = crawl_db.create_crawl(None, 'old', 'https://example.test',
                                               'example.test', {**bounded, **overrides})
                 with self.subTest(saved=overrides):
                     self.assertEqual(client.post(f'/api/crawls/{saved}/resume', headers=headers).status_code, 400)
+            legacy = {key: value for key, value in bounded.items() if key != 'enable_link_checks'}
+            self.assertIsNone(service.capture_policy_error(legacy))
             for value in (0, float('nan'), float('inf'), 11 * 1024 * 1024):
                 self.assertIsNotNone(service.capture_limit_error(
                     {'max_urls': 100, 'max_depth': 2, 'max_file_size': value}))
